@@ -99,4 +99,12 @@ cmd_enable()    { require_root; rm -f "$DISABLE_FLAG_ETC"; systemctl daemon-relo
 boot_dir()      { [[ -d /boot/firmware ]] && echo /boot/firmware || echo /boot; }
 cmd_boot_disable(){ require_root; local d; d="$(boot_dir)"; touch "$d/hue.disable"; systemctl stop "$SERVICE_NAME" || true; echo "Created $d/hue.disable"; }
 cmd_boot_enable(){ require_root; local changed=0; [[ -f "$BOOT_FLAG_1" ]] && { rm -f "$BOOT_FLAG_1"; changed=1; }; [[ -f "$BOOT_FLAG_2" ]] && { rm -f "$BOOT_FLAG_2"; changed=1; }; [[ "$changed" -eq 1 ]] && echo "Removed boot flag(s)."; systemctl daemon-reload; systemctl restart "$SERVICE_NAME" || true; }
-cmd_set_port()  { require_root; PORT="${1:-}"; [[ -n "$PORT"]()]()_
+cmd_set_port() {\
+  require_root\
+  local PORT="${1:-}"\
+  if [[ -z "$PORT" || ! "$PORT" =~ ^[0-9]+$ || "$PORT" -lt 1 || "$PORT" -gt 65535 ]]; then\
+    echo "Usage: $0 set-port <1-65535>"\
+    exit 2\
+  fi\
+  echo "[+] Port validated: $PORT"\
+}' "/opt/escaperoomservers/repo/Hue Server/data/setup_hue_server.sh"
