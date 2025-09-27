@@ -205,6 +205,9 @@ def build_wave_from_durations(durations: List[int], tx_gpio: int, carrier_khz: f
             if space > 0:
                 pulses.append(pigpio.pulse(0, 1 << tx_gpio, space))
 
+    # *** Important: finish LOW so the line doesn't stick high ***
+    pulses.append(pigpio.pulse(0, 1 << tx_gpio, 100))  # 100us off
+
     pi.wave_add_generic(pulses)
     wave_id = pi.wave_create()
     if wave_id < 0:
@@ -215,28 +218,22 @@ def send_durations(durations: List[int], repeat: int, gap_us: int, carrier_khz: 
     if not durations:
         return
 
-    # Build the frame wave once
     frame_id = build_wave_from_durations(durations, TX_GPIO, carrier_khz)
     gap_id = None
-    wave_ids = [frame_id]  # keep track so we can delete after tx
+    wave_ids = [frame_id]
 
     try:
         chain = []
         rep = max(1, int(repeat))
 
         for i in range(rep):
-            # play the frame
             chain += [255, 0, frame_id]
-
-            # add gap between repeats (not after the last frame)
             if gap_us > 0 and i < rep - 1:
                 if gap_us >= 1000:
-                    # Use wave_chain delay (milliseconds, 16-bit)
                     ms = int(round(gap_us / 1000.0))
                     ms = max(1, min(ms, 65535))
                     chain += [255, 1, (ms >> 8) & 0xFF, ms & 0xFF]
                 else:
-                    # For sub-ms gaps build one gap-only wave and reuse it
                     if gap_id is None:
                         pi.wave_add_generic([pigpio.pulse(0, 1 << TX_GPIO, gap_us)])
                         gap_id = pi.wave_create()
@@ -245,19 +242,22 @@ def send_durations(durations: List[int], repeat: int, gap_us: int, carrier_khz: 
                         wave_ids.append(gap_id)
                     chain += [255, 0, gap_id]
 
-        # Transmit then wait until done
         pi.wave_chain(chain)
         while pi.wave_tx_busy():
             time.sleep(0.002)
 
     finally:
-        # Only delete after transmission is fully complete
+        # NEW: belt-and-suspenders cleanup so TX is guaranteed low and pigpio isn't busy
+        try:
+            pi.wave_tx_stop()
+        except pigpio.error:
+            pass
+        pi.write(TX_GPIO, 0)
         for wid in wave_ids:
             try:
                 pi.wave_delete(wid)
             except pigpio.error:
                 pass
-
 
 # =========================
 # Simple helper: parse "ms" CSV into ints
@@ -426,4 +426,5 @@ signal.signal(signal.SIGINT, handle_sigterm)
 # =========================
 if __name__ == "__main__":
     uvicorn.run("ir_server:app", host="0.0.0.0", port=8001, reload=False)
+
 
