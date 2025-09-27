@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IR Server installer / service manager
+# IR Server installer / service manager (COGS endpoints version)
 # Usage:
 #   sudo bash setup_ir_server.sh install
 #   sudo bash setup_ir_server.sh enable|disable|start|stop|status|remove
@@ -11,11 +11,11 @@ sed -i 's/\r$//' "$0" >/dev/null 2>&1 || true
 APP_DIR="/opt/ir-server"
 VENV_DIR="${APP_DIR}/.venv"
 APP_PY="${APP_DIR}/ir_server.py"
-CODES_JSON="${APP_DIR}/ir_codes.json"
+SIGNALS_DIR="${APP_DIR}/signals"
 SERVICE="ir-server.service"
 
-# Defaults (override via systemd Environment later if desired)
-IR_TX_GPIO="${IR_TX_GPIO:-18}"
+# Defaults (kept for parity with your prior installer; can be used by a future server update)
+IR_TX_GPIO="${IR_TX_GPIO:-22}"
 IR_RX_GPIO="${IR_RX_GPIO:-23}"
 IR_CARRIER_KHZ="${IR_CARRIER_KHZ:-38.0}"
 
@@ -31,6 +31,7 @@ ensure_deps() {
 install_app() {
   echo "[*] Installing IR server to ${APP_DIR}"
   mkdir -p "${APP_DIR}"
+  mkdir -p "${SIGNALS_DIR}"
 
   # Copy Python (normalize line endings)
   if [ -f "${SCRIPT_DIR}/ir_server.py" ]; then
@@ -41,25 +42,15 @@ install_app() {
     exit 1
   fi
 
-  # Preserve existing codes.json
-  if [ ! -f "${CODES_JSON}" ]; then
-    if [ -f "${SCRIPT_DIR}/ir_codes.json" ]; then
-      sed -i 's/\r$//' "${SCRIPT_DIR}/ir_codes.json" || true
-      install -m 0644 "${SCRIPT_DIR}/ir_codes.json" "${CODES_JSON}"
-    else
-      echo "{}" > "${CODES_JSON}"
-    fi
-  fi
-
   # Python venv + deps
   python3 -m venv "${VENV_DIR}"
   "${VENV_DIR}/bin/pip" install --upgrade pip wheel
-  "${VENV_DIR}/bin/pip" install fastapi uvicorn pigpio
+  "${VENV_DIR}/bin/pip" install fastapi uvicorn pigpio pydantic
 
-  # systemd unit
+  # systemd unit (same pattern as your existing manager, including sentinel disable files)
   cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
-Description=IR Server (FastAPI + pigpio)
+Description=IR Server (FastAPI + pigpio, COGS endpoints)
 Wants=network-online.target pigpiod.service
 After=network-online.target pigpiod.service
 # Allow disabling at boot with either file:
@@ -73,7 +64,7 @@ WorkingDirectory=${APP_DIR}
 Environment=IR_TX_GPIO=${IR_TX_GPIO}
 Environment=IR_RX_GPIO=${IR_RX_GPIO}
 Environment=IR_CARRIER_KHZ=${IR_CARRIER_KHZ}
-Environment=IR_CODES_DB=${CODES_JSON}
+# If you later update ir_server.py to read these env vars, they'll be ready.
 ExecStart=${VENV_DIR}/bin/uvicorn ir_server:app --host 0.0.0.0 --port 8001
 Restart=on-failure
 RestartSec=2

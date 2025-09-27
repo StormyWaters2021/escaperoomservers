@@ -1,494 +1,400 @@
 #!/usr/bin/env python3
-"""
-IR Server (FastAPI + pigpio) — COGs-friendly GET endpoints.
+import os
+import json
+import time
+from typing import List, Optional, Dict, Any, Tuple
 
-Health
-  GET /cogs/health
+from fastapi import FastAPI, HTTPException, Query
+import uvicorn
 
-Send a named code (from DB)
-  GET /cogs/ir/send?remote=...&key=...[&carrier=38][&scale=1.0][&repeat=1][&gap_us=7200]
-
-Send a raw burst (milliseconds CSV in URL; accepts signed or unsigned)
-  GET /cogs/ir/send_raw?ms=900,-450,900,-450[&carrier=38][&scale=1.0][&repeat=1][&gap_us=7200]
-
-Press-and-hold (repeat in a loop until stopped)
-  GET /cogs/ir/hold/start?remote=...&key=...&interval_ms=110&hold_id=H[&carrier=38][&scale=1.0]
-  GET /cogs/ir/hold/start?ms=CSV&interval_ms=110&hold_id=H[&carrier=38][&scale=1.0]
-  GET /cogs/ir/hold/stop?hold_id=H
-  GET /cogs/ir/hold/stop_all
-  GET /cogs/ir/stop              # alias for stop_all
-
-Learn
-  GET /cogs/ir/learn/start
-  GET /cogs/ir/learn/stop/{remote}/{key}
-
-Manage learned codes
-  GET /cogs/ir/list
-  GET /cogs/ir/delete/{Remote_Key}    # use "Remote/Key" (slash) or underscore in name and it will be spaced
-
-Environment (systemd Environment=...)
-  IR_TX_GPIO       (default 18)   # BCM
-  IR_RX_GPIO       (default 23)   # BCM
-  IR_CARRIER_KHZ   (default 38.0)
-  IR_CODES_DB      (default /opt/ir-server/ir_codes.json)
-  IR_DEBUG         (default 0)
-"""
-
-import os, json, time, threading
-from typing import List, Optional
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 import pigpio
+import threading
+import signal
+import subprocess
+import atexit
 
-# ---- config from env ---------------------------------------------------------
-IR_TX_GPIO = int(os.environ.get("IR_TX_GPIO", "18"))
-IR_RX_GPIO = int(os.environ.get("IR_RX_GPIO", "23"))
-IR_CARRIER_KHZ = float(os.environ.get("IR_CARRIER_KHZ", "38.0"))
-IR_CODES_DB = os.environ.get("IR_CODES_DB", "/opt/ir-server/ir_codes.json")
-IR_DEBUG = int(os.environ.get("IR_DEBUG", "0"))
+# =========================
+# Config (edit as needed)
+# =========================
+TX_GPIO = 22                 # IR LED output pin (via transistor)
+RX_GPIO = 23                 # IR receiver (demodulated) input pin (TSOP style)
+CARRIER_KHZ_DEFAULT = 38.0   # default carrier
+SIGNALS_DIR = "./signals"    # where learned signals are stored
+LONG_GAP_US = 7000           # gap threshold to split frames (us)
+TOLERANCE_PCT = 0.2          # timing compare tolerance for repeat detection (20%)
+ROUND_TO_US = 50             # normalize durations to nearest N us for storage
+MAX_CAPTURE_SECONDS = 3.0    # safety cap for learning
+MIN_PULSES_TO_ACCEPT = 6     # ignore tiny/noisy captures
 
-# ---- robust pigpio handle/reconnect -----------------------------------------
-_PI = None
-_PI_LOCK = threading.Lock()
+os.makedirs(SIGNALS_DIR, exist_ok=True)
 
-def get_pi():
-    """(Re)connect to local pigpiod and return a healthy handle."""
-    global _PI
-    with _PI_LOCK:
-        if _PI is None:
-            _PI = pigpio.pi()
-        try:
-            _PI.get_current_tick()    # cheap ping
-        except Exception:
-            try:
-                _PI.stop()
-            except Exception:
-                pass
-            _PI = pigpio.pi()
-        if not _PI.connected:
-            raise RuntimeError("pigpiod not connected")
-        return _PI
+app = FastAPI(title="IR Learn/Send Server", version="1.1 (COGS-style URLs)")
 
-def _retry(fn, n=1, delay=0.05):
-    """Run fn(), retrying once after forcing reconnect if it fails."""
-    global _PI
-    for i in range(n + 1):
-        try:
-            return fn()
-        except Exception:
-            if i < n:
-                try: _PI.stop()
-                except Exception: pass
-                _PI = None
-                time.sleep(delay)
-            else:
-                raise
-
-# ---- DB helpers --------------------------------------------------------------
-def _load_codes():
+# =========================
+# pigpio init
+# =========================
+def ensure_pigpiod():
     try:
-        with open(IR_CODES_DB, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_codes(data):
-    os.makedirs(os.path.dirname(IR_CODES_DB), exist_ok=True)
-    with open(IR_CODES_DB, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ---- burst normalization / scaling ------------------------------------------
-def normalize_burst_us(seq: List[int]) -> List[int]:
-    """
-    Accept unsigned [on,off,on,off,...] OR signed [+on,-off,...].
-    Drop zeros, enforce even length, and make even idx positive, odd idx negative.
-    """
-    arr = []
-    for x in seq:
-        try:
-            xi = int(x)
-        except Exception:
-            continue
-        if xi != 0:
-            arr.append(xi)
-    if not arr:
-        raise ValueError("empty IR burst")
-
-    # enforce ± by index (even = +, odd = -)
-    out = []
-    for i, v in enumerate(arr):
-        v = abs(int(v))
-        out.append(v if i % 2 == 0 else -v)
-
-    if len(out) % 2 == 1:
-        out = out[:-1]
-    if not out:
-        raise ValueError("invalid IR burst after normalization")
-    return out
-
-def apply_scale_us(durations_us: List[int], scale: float) -> List[int]:
-    if scale is None or scale == 1.0:
-        return durations_us
-    out = []
-    for i, v in enumerate(durations_us):
-        s = max(1, int(round(abs(int(v)) * float(scale))))
-        out.append(s if i % 2 == 0 else -s)
-    return out
-
-def extract_first_frame_us(durations_us: List[int], gap_us: int = 7000) -> List[int]:
-    """
-    Split on an inter-frame gap (OFF >= gap_us). Return only the first frame.
-    Default gap 7 ms—adjustable via query 'gap_us'.
-    """
-    arr = normalize_burst_us(durations_us)
-    out = []
-    it = iter(arr)
-    for on in it:
-        off = next(it, None)
-        if off is None:
-            break
-        out += [on, off]
-        if abs(off) >= gap_us:
-            break
-    if len(out) % 2 == 1:
-        out = out[:-1]
-    return out if out else arr
-
-# ---- pulses/wave building ----------------------------------------------------
-def build_pulses_for_burst(tx_gpio: int, durations_us: List[int], carrier_khz: float, duty_pct: float = 33.0):
-    """
-    Translate [+on,-off,...] µs into pigpio.pulse list, modulating +on with carrier
-    at duty cycle (default ≈33%, common for many remotes).
-    """
-    pi = get_pi()
-    pulses = []
-    period = max(2, int(round(1_000_000 / (float(carrier_khz) * 1000.0))))
-    on_us = max(1, int(round(period * (duty_pct / 100.0))))
-    off_us = max(1, period - on_us)
-
-    def mark(us: int):
-        remaining = max(1, int(us))
-        while remaining > 0:
-            t_on = on_us if remaining >= period else min(on_us, remaining)
-            t_off = off_us if remaining >= period else max(0, remaining - t_on)
-            pulses.append(pigpio.pulse(1 << tx_gpio, 0, t_on))
-            if t_off > 0:
-                pulses.append(pigpio.pulse(0, 1 << tx_gpio, t_off))
-            remaining -= (t_on + t_off)
-
-    def space(us: int):
-        pulses.append(pigpio.pulse(0, 1 << tx_gpio, max(1, int(us))))
-
-
-    it = iter(durations_us)
-    for on_dur in it:
-        if on_dur <= 0:
-            continue
-        mark(on_dur)
-        off_dur = next(it, None)
-        if off_dur is None:
-            break
-        if off_dur != 0:
-            space(abs(int(off_dur)))
-
-    return pulses
-
-def send_raw_burst(durations_us: List[int], carrier_khz: float):
-    durations = normalize_burst_us(durations_us)
-    pulses = build_pulses_for_burst(IR_TX_GPIO, durations, carrier_khz, duty_pct=33.0)
-
-    MAX_PULSES = 9000
-    total = len(pulses)
-    if IR_DEBUG:
-        print(f"[send] durations={len(durations)} pulses={total}")
-        print(f"Durations: {durations[:20]}")
-        print(f"First 10 pulses: {[ (p.gpio_on, p.gpio_off, p.delay) for p in pulses[:10] ]}")
-
-    idx = 0
-    while idx < total:
-        chunk = pulses[idx: idx + MAX_PULSES]
-        idx += len(chunk)
-
-        _retry(lambda: (get_pi().wave_tx_stop(), get_pi().wave_clear()))
-        _retry(lambda: get_pi().wave_add_generic(chunk))
-        wid = _retry(lambda: get_pi().wave_create())
-        try:
-            _retry(lambda: get_pi().wave_send_once(wid))
-            while get_pi().wave_tx_busy():
-                time.sleep(0.0015)
-        finally:
-            try:
-                _retry(lambda: get_pi().wave_delete(wid))
-            except Exception:
-                pass
-
-def send_repeated_frame(durations_us: List[int], carrier_khz: float, repeat: int, gap_us: int):
-    """
-    Send the first frame 'repeat' times with 'gap_us' silence between frames.
-    """
-    frame = extract_first_frame_us(durations_us, gap_us=gap_us)
-    for i in range(max(1, int(repeat))):
-        send_raw_burst(frame, carrier_khz)
-        if i != repeat - 1 and gap_us > 0:
-            # insert inter-frame silence (space)
-            # implement as an ON(1) + long OFF, normalize will fix shape
-            send_raw_burst([1, gap_us], carrier_khz)
-
-# ---- learn / capture ---------------------------------------------------------
-_learn_lock = threading.Lock()
-_learn_active = False
-_learn_edges: List[int] = []
-_learn_cb = None
-_learn_start_tick = 0
-
-def _rx_callback(gpio, level, tick):
-    global _learn_start_tick
-    if _learn_start_tick == 0:
-        _learn_start_tick = tick
+        pi = pigpio.pi()
+        if not pi.connected:
+            raise RuntimeError("pigpio not connected")
+        pi.stop()
         return
-    _learn_edges.append(pigpio.tickDiff(_learn_start_tick, tick))
-    _learn_start_tick = tick
-
-def learn_start():
-    global _learn_active, _learn_edges, _learn_cb, _learn_start_tick
-    with _learn_lock:
-        if _learn_active:
-            return
-        _learn_active = True
-        _learn_edges = []
-        _learn_start_tick = 0
-        pi = get_pi()
-        pi.set_mode(IR_RX_GPIO, pigpio.INPUT)
-        pi.set_pull_up_down(IR_RX_GPIO, pigpio.PUD_OFF)
-        _learn_cb = pi.callback(IR_RX_GPIO, pigpio.EITHER_EDGE, _rx_callback)
-
-def learn_stop_and_save(remote: str, key: str):
-    global _learn_active, _learn_edges, _learn_cb
-    with _learn_lock:
-        if not _learn_active:
-            raise RuntimeError("learn not active")
-        try:
-            if _learn_cb is not None:
-                _learn_cb.cancel()
-        finally:
-            _learn_cb = None
-            _learn_active = False
-
-    if IR_DEBUG:
-        print(f"[learn] edges captured: {len(_learn_edges)}")
-
-    # store as unsigned microseconds (send path accepts either)
-    raw_burst = _learn_edges
-
-    # Fix leading zero if present
-    if raw_burst and raw_burst[0] == 0:
-        raw_burst = raw_burst[1:]
-
-    # Normalize the full capture
-    normalized = normalize_burst_us(raw_burst)
-
-    # Only keep the first logical frame (split on gap_us)
-    first_frame = extract_first_frame_us(normalized, gap_us=7000)
-
-    # Store only the clean frame
-    burst = [abs(int(x)) for x in first_frame]
-
-    db = _load_codes()
-    db.setdefault(remote, {})[key] = [abs(int(x)) for x in burst]
-    _save_codes(db)
-    return burst
-
-# ---- hold / repeat threads ---------------------------------------------------
-_hold_threads = {}
-_hold_stop = {}
-
-def _hold_worker(hold_id: str, burst_us: List[int], carrier: float, interval_ms: int):
+    except Exception:
+        pass
     try:
-        norm = normalize_burst_us(burst_us)
-        while not _hold_stop.get(hold_id, False):
-            send_raw_burst(norm, carrier)
-            time.sleep(max(0.001, interval_ms / 1000.0))
-    finally:
-        _hold_stop.pop(hold_id, None)
-        _hold_threads.pop(hold_id, None)
+        subprocess.run(["sudo", "pigpiod"], check=False)
+        time.sleep(0.2)
+    except Exception:
+        pass
 
-def hold_start_from_burst(hold_id: str, burst_us: List[int], carrier: float, interval_ms: int):
-    if hold_id in _hold_threads:
-        raise RuntimeError(f"hold_id '{hold_id}' already running")
-    _hold_stop[hold_id] = False
-    t = threading.Thread(target=_hold_worker, args=(hold_id, burst_us, carrier, interval_ms), daemon=True)
-    _hold_threads[hold_id] = t
-    t.start()
+ensure_pigpiod()
+pi = pigpio.pi()
+if not pi.connected:
+    raise SystemExit("Unable to connect to pigpio. Ensure pigpiod is running: sudo pigpiod")
 
-def hold_stop(hold_id: str):
-    if hold_id in _hold_threads:
-        _hold_stop[hold_id] = True
-        return True
-    return False
+pi.set_mode(TX_GPIO, pigpio.OUTPUT)
+pi.set_mode(RX_GPIO, pigpio.INPUT)
+pi.set_pull_up_down(RX_GPIO, pigpio.PUD_OFF)
 
-def hold_stop_all():
-    for hid in list(_hold_threads.keys()):
-        _hold_stop[hid] = True
+# =========================
+# Utilities
+# =========================
+def round_us(v: int, step: int = ROUND_TO_US) -> int:
+    return int(round(v / step) * step)
+
+def approx_equal(a: int, b: int, tol_pct: float = TOLERANCE_PCT) -> bool:
+    m = max(1, max(a, b))
+    return abs(a - b) <= m * tol_pct
+
+def frames_equal(f1: List[int], f2: List[int], tol_pct: float = TOLERANCE_PCT) -> bool:
+    if len(f1) != len(f2):
+        return False
+    for a, b in zip(f1, f2):
+        if (a > 0) != (b > 0):
+            return False
+        if not approx_equal(abs(a), abs(b), tol_pct):
+            return False
     return True
 
-# ---- FastAPI app & routes ----------------------------------------------------
-app = FastAPI(title="IR Server")
+def compress_repeats(frames: List[List[int]]) -> Tuple[List[int], int, int]:
+    if not frames:
+        return [], 0, LONG_GAP_US
 
-@app.get("/")
-def root():
-    return {
-        "cogs_endpoints": [
-            "/cogs/health",
-            "/cogs/ir/send?remote=...&key=...[&carrier=38][&scale=1.0][&repeat=1][&gap_us=7200]",
-            "/cogs/ir/send_raw?ms=CSV[&carrier=38][&scale=1.0][&repeat=1][&gap_us=7200]",
-            "/cogs/ir/hold/start?remote=...&key=...&interval_ms=110&hold_id=...&carrier=38&scale=1.0",
-            "/cogs/ir/hold/start?ms=CSV&interval_ms=110&hold_id=...&carrier=38&scale=1.0",
-            "/cogs/ir/hold/stop?hold_id=...",
-            "/cogs/ir/hold/stop_all",
-            "/cogs/ir/stop",
-            "/cogs/ir/learn/start",
-            "/cogs/ir/learn/stop/{remote}/{key}",
-            "/cogs/ir/list",
-            "/cogs/ir/delete/{Remote_Key}"
-        ]
+    norm = [[(round_us(d) if d > 0 else -round_us(-d)) for d in fr] for fr in frames]
+    canonical = norm[0]
+    repeats = 1
+    for fr in norm[1:]:
+        if frames_equal(canonical, fr):
+            repeats += 1
+        else:
+            from collections import Counter
+            key = lambda arr: tuple(arr)
+            counts = Counter([key(f) for f in norm])
+            canonical = list(counts.most_common(1)[0][0])
+            repeats = counts.most_common(1)[0][1]
+            break
+
+    gap_us = LONG_GAP_US
+    if canonical:
+        if canonical[-1] < 0:
+            gap_us = abs(canonical[-1])
+        else:
+            gap_us = LONG_GAP_US
+
+    return canonical, repeats, gap_us
+
+def save_signal(name: str, data: Dict[str, Any]) -> None:
+    path = os.path.join(SIGNALS_DIR, f"{name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def load_signal(name: str) -> Dict[str, Any]:
+    path = os.path.join(SIGNALS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(name)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def list_signals() -> List[str]:
+    return sorted([fn[:-5] for fn in os.listdir(SIGNALS_DIR) if fn.endswith(".json")])
+
+# =========================
+# Capturing (Learn)
+# =========================
+class CaptureSession:
+    def __init__(self, rx_gpio: int):
+        self.rx = rx_gpio
+        self.cb = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.last_tick = None
+        self.level = pi.read(self.rx)
+        self.raw_us: List[int] = []
+
+    def _edge(self, gpio, level, tick):
+        with self.lock:
+            if self.last_tick is None:
+                self.last_tick = tick
+                self.level = level
+                return
+            dt = pigpio.tickDiff(self.last_tick, tick)
+            self.last_tick = tick
+            if self.level == 0:
+                self.raw_us.append(+dt)  # mark
+            else:
+                self.raw_us.append(-dt)  # space
+            self.level = level
+
+    def start(self):
+        with self.lock:
+            self.running = True
+            self.last_tick = None
+            self.raw_us = []
+            self.level = pi.read(self.rx)
+            self.cb = pi.callback(self.rx, pigpio.EITHER_EDGE, self._edge)
+
+    def stop(self):
+        with self.lock:
+            if self.cb is not None:
+                self.cb.cancel()
+                self.cb = None
+            self.running = False
+
+    def get_result(self) -> List[int]:
+        with self.lock:
+            trimmed = [d for d in self.raw_us if abs(d) >= 80]
+            if trimmed and trimmed[0] < 0:
+                trimmed = trimmed[1:]
+            return trimmed
+
+def split_frames(raw: List[int], gap_us: int = LONG_GAP_US) -> List[List[int]]:
+    frames = []
+    cur = []
+    for d in raw:
+        cur.append(d)
+        if d < 0 and abs(d) >= gap_us:
+            frames.append(cur)
+            cur = []
+    if cur:
+        frames.append(cur)
+    return frames
+
+# =========================
+# Sending (pigpio wave)
+# =========================
+def build_wave_from_durations(durations: List[int], tx_gpio: int, carrier_khz: float) -> int:
+    pulses = []
+    carrier_period_us = int(round(1000.0 / carrier_khz))
+    half = max(1, carrier_period_us // 2)
+
+    for dur in durations:
+        if dur > 0:
+            remaining = dur
+            while remaining > 0:
+                on_us = min(half, remaining)
+                pulses.append(pigpio.pulse(1 << tx_gpio, 0, on_us))
+                remaining -= on_us
+                if remaining <= 0:
+                    break
+                off_us = min(half, remaining)
+                pulses.append(pigpio.pulse(0, 1 << tx_gpio, off_us))
+                remaining -= off_us
+        else:
+            space = -dur
+            if space > 0:
+                pulses.append(pigpio.pulse(0, 1 << tx_gpio, space))
+
+    pi.wave_add_generic(pulses)
+    wave_id = pi.wave_create()
+    if wave_id < 0:
+        raise RuntimeError("wave_create failed")
+    return wave_id
+
+def send_durations(durations: List[int], repeat: int, gap_us: int, carrier_khz: float):
+    if not durations:
+        return
+    wave_id = build_wave_from_durations(durations, TX_GPIO, carrier_khz)
+    try:
+        chain = []
+        for _ in range(max(1, repeat)):
+            chain += [255, 0, wave_id]
+            if gap_us > 0:
+                pi.wave_add_generic([pigpio.pulse(0, 1 << TX_GPIO, gap_us)])
+                gap_id = pi.wave_create()
+                chain += [255, 0, gap_id]
+                pi.wave_delete(gap_id)
+
+        pi.wave_chain(chain)
+        while pi.wave_tx_busy():
+            time.sleep(0.002)
+    finally:
+        pi.wave_delete(wave_id)
+
+# =========================
+# Simple helper: parse "ms" CSV into ints
+# =========================
+def parse_ms_csv(ms_csv: str) -> List[int]:
+    out = []
+    for token in ms_csv.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except Exception:
+            raise HTTPException(400, f"Bad ms value: '{token}'")
+    if not out:
+        raise HTTPException(400, "No ms values provided")
+    if out[0] < 0:
+        raise HTTPException(400, "ms must start with a positive mark")
+    return out
+
+# =========================
+# COGS-style GET endpoints (no headers required)
+# =========================
+@app.get("/cogs/ir/learn")
+def learn_get(
+    name: Optional[str] = Query(default=None),
+    timeout_s: float = Query(default=1.5, ge=0.2, le=MAX_CAPTURE_SECONDS),
+    long_gap_us: int = Query(default=LONG_GAP_US, ge=2000),
+):
+    cap = CaptureSession(RX_GPIO)
+    cap.start()
+    time.sleep(timeout_s)
+    cap.stop()
+
+    raw = cap.get_result()
+    if len(raw) < MIN_PULSES_TO_ACCEPT:
+        raise HTTPException(400, "No valid IR activity captured. Try again while pressing a remote key.")
+
+    frames = split_frames(raw, gap_us=long_gap_us)
+    canonical, repeats, gap_us = compress_repeats(frames)
+    canonical = [(round_us(d) if d > 0 else -round_us(-d)) for d in canonical]
+
+    result = {
+        "ok": True,
+        "frames_detected": len(frames),
+        "canonical_durations_us": canonical,
+        "repeats": repeats,
+        "gap_us": gap_us,
+        "total_pulses": len(raw),
     }
 
-@app.get("/cogs/health")
-def cogs_health():
-    ok = True
-    try:
-        get_pi()
-    except Exception:
-        ok = False
-    return {"ok": ok, "tx_gpio": IR_TX_GPIO, "rx_gpio": IR_RX_GPIO, "carrier_khz": IR_CARRIER_KHZ}
+    if name:
+        payload = {
+            "name": name,
+            "carrier_khz": CARRIER_KHZ_DEFAULT,
+            "canonical_durations_us": canonical,
+            "repeats": repeats,
+            "gap_us": gap_us,
+            "meta": {
+                "captured_at": int(time.time()),
+                "rx_gpio": RX_GPIO,
+                "tx_gpio": TX_GPIO,
+                "long_gap_us": long_gap_us,
+                "tolerance_pct": TOLERANCE_PCT,
+                "round_to_us": ROUND_TO_US,
+            },
+        }
+        save_signal(name, payload)
+        result["name"] = name
 
-# ---- SEND (named) ------------------------------------------------------------
+    return result
+
 @app.get("/cogs/ir/send")
-def cogs_send_named(
-    remote: str,
-    key: str,
-    carrier: Optional[float] = None,
-    scale: Optional[float] = 1.0,
-    repeat: int = 1,
-    gap_us: int = 7200
+def send_saved_get(
+    name: str = Query(...),
+    repeat: Optional[int] = Query(default=None, ge=1),
+    carrier: Optional[float] = Query(default=None),  # kHz
+    scale: Optional[float] = Query(default=1.0),
 ):
-    db = _load_codes()
-    if remote not in db or key not in db[remote]:
-        raise HTTPException(status_code=404, detail=f"Unknown remote/key: {remote}/{key}")
-    raw = [int(x) for x in db[remote][key]]
+    try:
+        data = load_signal(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Signal '{name}' not found")
 
-    # Trim to a single frame, optionally scale, then repeat/gap as requested
-    frame = extract_first_frame_us(raw, gap_us=gap_us)
-    frame = apply_scale_us(frame, scale or 1.0)
-    if repeat and repeat > 1:
-        send_repeated_frame(frame, carrier or IR_CARRIER_KHZ, repeat=repeat, gap_us=gap_us)
-    else:
-        send_raw_burst(frame, carrier or IR_CARRIER_KHZ)
-    return {"ok": True, "remote": remote, "key": key, "repeat": repeat, "gap_us": gap_us, "carrier_khz": (carrier or IR_CARRIER_KHZ), "scale": (scale or 1.0)}
+    durations = data["canonical_durations_us"]
+    repeats = data.get("repeats", 1)
+    gap_us = data.get("gap_us", LONG_GAP_US)
+    carrier_khz = data.get("carrier_khz", CARRIER_KHZ_DEFAULT)
 
-# ---- SEND RAW (ms CSV) -------------------------------------------------------
+    if repeat is not None:
+        repeats = max(1, int(repeat))
+    if carrier is not None:
+        carrier_khz = float(carrier)
+    scale = float(scale or 1.0)
+
+    scaled = [int(round(d * scale)) if d > 0 else -int(round((-d) * scale)) for d in durations]
+
+    try:
+        send_durations(scaled, repeat=repeats, gap_us=gap_us, carrier_khz=carrier_khz)
+    except Exception as e:
+        raise HTTPException(400, f"Failed to send: {e}")
+
+    return {"ok": True, "name": name, "repeat": repeats, "gap_us": gap_us, "carrier_khz": carrier_khz, "scale": scale}
+
 @app.get("/cogs/ir/send_raw")
-def cogs_send_raw(ms: str, carrier: Optional[float] = None, scale: Optional[float] = 1.0, repeat: int = 1, gap_us: int = 7200):
-    try:
-        parts = [p.strip() for p in ms.split(",") if p.strip() != ""]
-        ms_vals = [int(float(p)) for p in parts]
-        us_vals = [v * 1000 for v in ms_vals]
-        frame = extract_first_frame_us(us_vals, gap_us=gap_us)
-        frame = apply_scale_us(frame, scale or 1.0)
-        if repeat and repeat > 1:
-            send_repeated_frame(frame, carrier or IR_CARRIER_KHZ, repeat=repeat, gap_us=gap_us)
-        else:
-            send_raw_burst(frame, carrier or IR_CARRIER_KHZ)
-        return {"ok": True, "count_ms": len(ms_vals), "repeat": repeat, "gap_us": gap_us, "carrier_khz": (carrier or IR_CARRIER_KHZ), "scale": (scale or 1.0)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bad ms burst: {e}")
-
-# ---- HOLD / REPEAT -----------------------------------------------------------
-@app.get("/cogs/ir/hold/start")
-def cogs_hold_start(
-    hold_id: str,
-    interval_ms: int,
-    remote: Optional[str] = None,
-    key: Optional[str] = None,
-    ms: Optional[str] = None,
-    carrier: Optional[float] = None,
-    scale: Optional[float] = 1.0
+def send_raw_get(
+    ms: str = Query(..., description="Comma-separated signed microsecond durations (e.g. 900,-450,...)"),
+    repeat: int = Query(default=1, ge=1),
+    gap_us: int = Query(default=LONG_GAP_US, ge=0),
+    carrier: float = Query(default=CARRIER_KHZ_DEFAULT, description="Carrier in kHz (e.g. 38)"),
 ):
-    if not hold_id:
-        raise HTTPException(status_code=400, detail="hold_id required")
-    if ms:
-        parts = [p.strip() for p in ms.split(",") if p.strip() != ""]
-        ms_vals = [int(float(p)) for p in parts]
-        burst = [v * 1000 for v in ms_vals]
-    else:
-        if not (remote and key):
-            raise HTTPException(status_code=400, detail="remote/key or ms required")
-        db = _load_codes()
-        if remote not in db or key not in db[remote]:
-            raise HTTPException(status_code=404, detail=f"Unknown remote/key: {remote}/{key}")
-        burst = [int(x) for x in db[remote][key]]
-
-    frame = extract_first_frame_us(burst)
-    frame = apply_scale_us(frame, scale or 1.0)
-    hold_start_from_burst(hold_id, frame, carrier or IR_CARRIER_KHZ, interval_ms)
-    return {"ok": True, "hold_id": hold_id}
-
-@app.get("/cogs/ir/hold/stop")
-def cogs_hold_stop(hold_id: str):
-    return {"ok": hold_stop(hold_id), "hold_id": hold_id}
-
-@app.get("/cogs/ir/hold/stop_all")
-def cogs_hold_stop_all():
-    hold_stop_all()
-    return {"ok": True}
-
-@app.get("/cogs/ir/stop")
-def cogs_stop_all():
-    hold_stop_all()
-    return {"ok": True}
-
-# ---- LEARN -------------------------------------------------------------------
-@app.get("/cogs/ir/learn/start")
-def cogs_learn_start():
-    learn_start()
-    return {"ok": True, "listening": True}
-
-@app.get("/cogs/ir/learn/stop/{remote}/{key}")
-def cogs_learn_stop(remote: str, key: str):
-    remote = remote.replace("_", " ").strip()
-    key = key.replace("_", " ").strip()
+    durations = parse_ms_csv(ms)
     try:
-        burst = learn_stop_and_save(remote, key)
-        return {"ok": True, "remote": remote, "key": key, "saved_len": len(burst)}
+        send_durations(durations, repeat=repeat, gap_us=gap_us, carrier_khz=carrier)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, f"Failed to send: {e}")
 
-# ---- LIST / DELETE -----------------------------------------------------------
-@app.get("/cogs/ir/list")
-def cogs_ir_list():
-    data = _load_codes()
-    names = []
-    for r, keys in data.items():
-        for k in keys:
-            names.append(f"{r}/{k}")
-    names.sort()
-    return {"ok": True, "count": len(names), "names": names}
+    return {"ok": True, "count": len(durations), "repeat": repeat, "gap_us": gap_us, "carrier_khz": carrier}
 
-@app.get("/cogs/ir/delete/{code_name}")
-def cogs_ir_delete(code_name: str):
-    name = code_name.replace("_", " ").strip()
-    if "/" in name:
-        remote, key = name.split("/", 1)
-    else:
-        raise HTTPException(status_code=400, detail="Use Remote/Key format for delete (with a slash)")
-    data = _load_codes()
-    if remote not in data or key not in data[remote]:
-        raise HTTPException(status_code=404, detail=f"Code '{remote}/{key}' not found")
-    data[remote].pop(key, None)
-    if not data[remote]:
-        data.pop(remote, None)
-    _save_codes(data)
-    return {"ok": True, "deleted": f"{remote}/{key}"}
+# Convenience/inspection (also GET)
+@app.get("/cogs/ir/status")
+def status_get():
+    return {"ok": True, "tx_gpio": TX_GPIO, "rx_gpio": RX_GPIO, "signals": list_signals()}
 
+@app.get("/cogs/ir/signals")
+def signals_get():
+    return {"ok": True, "signals": list_signals()}
 
+@app.get("/cogs/ir/signal")
+def signal_get(name: str = Query(...)):
+    try:
+        return load_signal(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Signal '{name}' not found")
+
+@app.get("/cogs/ir/delete")
+def delete_get(name: str = Query(...)):
+    path = os.path.join(SIGNALS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, f"Signal '{name}' not found")
+    os.remove(path)
+    return {"ok": True, "deleted": name}
+
+# =========================
+# Graceful shutdown
+# =========================
+def _cleanup():
+    try:
+        if pi is not None:
+            pi.write(TX_GPIO, 0)
+            pi.stop()
+    except Exception:
+        pass
+
+atexit.register(_cleanup)
+
+def handle_sigterm(signum, frame):
+    _cleanup()
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    uvicorn.run("ir_server:app", host="0.0.0.0", port=8001, reload=False)
