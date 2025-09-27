@@ -8,19 +8,17 @@ set -euo pipefail
 [ -z "${BASH_VERSION:-}" ] && exec /bin/bash "$0" "$@"
 sed -i 's/\r$//' "$0" >/dev/null 2>&1 || true
 
-# ---- Config ----
 APP_DIR="/opt/ir-server"
 VENV_DIR="${APP_DIR}/.venv"
 APP_PY="${APP_DIR}/ir_server.py"
 CODES_JSON="${APP_DIR}/ir_codes.json"
 SERVICE="ir-server.service"
 
-# Defaults (can be overridden in systemd Environment)
+# Defaults (override via systemd Environment later if desired)
 IR_TX_GPIO="${IR_TX_GPIO:-18}"
 IR_RX_GPIO="${IR_RX_GPIO:-23}"
 IR_CARRIER_KHZ="${IR_CARRIER_KHZ:-38.0}"
 
-# Resolve source directory (repo data folder)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 ensure_deps() {
@@ -33,7 +31,8 @@ ensure_deps() {
 install_app() {
   echo "[*] Installing IR server to ${APP_DIR}"
   mkdir -p "${APP_DIR}"
-  # Normalize and copy python file
+
+  # Copy Python (normalize line endings)
   if [ -f "${SCRIPT_DIR}/ir_server.py" ]; then
     sed -i 's/\r$//' "${SCRIPT_DIR}/ir_server.py" || true
     install -m 0644 "${SCRIPT_DIR}/ir_server.py" "${APP_PY}"
@@ -42,7 +41,7 @@ install_app() {
     exit 1
   fi
 
-  # Preserve existing codes DB if present
+  # Preserve existing codes.json
   if [ ! -f "${CODES_JSON}" ]; then
     if [ -f "${SCRIPT_DIR}/ir_codes.json" ]; then
       sed -i 's/\r$//' "${SCRIPT_DIR}/ir_codes.json" || true
@@ -52,18 +51,18 @@ install_app() {
     fi
   fi
 
-  # Python venv
+  # Python venv + deps
   python3 -m venv "${VENV_DIR}"
   "${VENV_DIR}/bin/pip" install --upgrade pip wheel
   "${VENV_DIR}/bin/pip" install fastapi uvicorn pigpio
 
-  # Service unit
+  # systemd unit
   cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
 Description=IR Server (FastAPI + pigpio)
 Wants=network-online.target pigpiod.service
 After=network-online.target pigpiod.service
-# Allow disabling at boot with a file (either path)
+# Allow disabling at boot with either file:
 ConditionPathExists=!/etc/ir-server.disabled
 ConditionPathExists=!/boot/firmware/server.disable
 
@@ -71,7 +70,6 @@ ConditionPathExists=!/boot/firmware/server.disable
 Type=simple
 User=root
 WorkingDirectory=${APP_DIR}
-# GPIO and settings (override with: systemctl edit ${SERVICE})
 Environment=IR_TX_GPIO=${IR_TX_GPIO}
 Environment=IR_RX_GPIO=${IR_RX_GPIO}
 Environment=IR_CARRIER_KHZ=${IR_CARRIER_KHZ}
@@ -90,8 +88,9 @@ EOF
   systemctl restart "${SERVICE}"
 
   echo "[+] Installed. Service: ${SERVICE} (port 8001)"
-  echo "    Disable boot:  sudo touch /etc/ir-server.disabled"
-  echo "                    OR place a file 'server.disable' on the boot partition (Windows-visible: /boot/firmware)"
+  echo "    Disable on boot:"
+  echo "      sudo touch /etc/ir-server.disabled"
+  echo "      # or create 'server.disable' on the boot partition (Windows-visible: /boot/firmware)"
 }
 
 disable_srv() { systemctl disable --now "${SERVICE}" || true; }
@@ -105,7 +104,7 @@ remove_all() {
   systemctl disable "${SERVICE}" || true
   rm -f "/etc/systemd/system/${SERVICE}"
   systemctl daemon-reload
-  echo "[!] Removed service. App files left at ${APP_DIR} (not deleted)."
+  echo "[!] Removed service. App files left at ${APP_DIR}."
   echo "    To delete app files: sudo rm -rf ${APP_DIR}"
 }
 
@@ -119,6 +118,5 @@ case "${1:-}" in
   remove)  remove_all ;;
   *)
     echo "Usage: sudo bash $0 {install|enable|disable|start|stop|status|remove}"
-    exit 1
-    ;;
+    exit 1 ;;
 esac
