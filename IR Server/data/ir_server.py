@@ -195,20 +195,13 @@ def build_pulses_for_burst(tx_gpio: int, durations_us: List[int], carrier_khz: f
     return pulses
 
 def send_raw_burst(durations_us: List[int], carrier_khz: float):
-    """
-    Send a (possibly long) burst by splitting into multiple waves so we never exceed
-    pigpio wave limits. This guarantees TX even for huge frames.
-    """
-    pi = get_pi()
     durations = normalize_burst_us(durations_us)
     pulses = build_pulses_for_burst(IR_TX_GPIO, durations, carrier_khz, duty_pct=33.0)
 
-    MAX_PULSES = 9000  # stay well under pigpio ~12k limit
+    MAX_PULSES = 9000
     total = len(pulses)
     if IR_DEBUG:
         print(f"[send] durations={len(durations)} pulses={total}")
-
-    if IR_DEBUG:
         print(f"Durations: {durations[:20]}")
         print(f"First 10 pulses: {[ (p.gpio_on, p.gpio_off, p.delay) for p in pulses[:10] ]}")
 
@@ -217,15 +210,18 @@ def send_raw_burst(durations_us: List[int], carrier_khz: float):
         chunk = pulses[idx: idx + MAX_PULSES]
         idx += len(chunk)
 
-        _retry(lambda: (pi.wave_tx_stop(), pi.wave_clear()))
-        _retry(lambda: pi.wave_add_generic(chunk))
-        wid = _retry(lambda: pi.wave_create())
+        _retry(lambda: (get_pi().wave_tx_stop(), get_pi().wave_clear()))
+        _retry(lambda: get_pi().wave_add_generic(chunk))
+        wid = _retry(lambda: get_pi().wave_create())
         try:
-            _retry(lambda: pi.wave_send_once(wid))
-            while pi.wave_tx_busy():
+            _retry(lambda: get_pi().wave_send_once(wid))
+            while get_pi().wave_tx_busy():
                 time.sleep(0.0015)
         finally:
-            _retry(lambda: pi.wave_delete(wid))
+            try:
+                _retry(lambda: get_pi().wave_delete(wid))
+            except Exception:
+                pass
 
 def send_repeated_frame(durations_us: List[int], carrier_khz: float, repeat: int, gap_us: int):
     """
@@ -494,4 +490,5 @@ def cogs_ir_delete(code_name: str):
         data.pop(remote, None)
     _save_codes(data)
     return {"ok": True, "deleted": f"{remote}/{key}"}
+
 
