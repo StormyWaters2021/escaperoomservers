@@ -163,7 +163,7 @@ def build_pulses_for_burst(tx_gpio: int, durations_us: List[int], carrier_khz: f
     """
     pi = get_pi()
     pulses = []
-    period = max(2, int(round(1_000_000 / float(carrier_khz))))
+    period = max(2, int(round(1_000_000 / (float(carrier_khz) * 1000.0))))
     on_us = max(1, int(round(period * (duty_pct / 100.0))))
     off_us = max(1, period - on_us)
 
@@ -494,3 +494,4 @@ def cogs_ir_delete(code_name: str):
         data.pop(remote, None)
     _save_codes(data)
     return {"ok": True, "deleted": f"{remote}/{key}"}
+
