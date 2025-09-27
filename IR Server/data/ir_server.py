@@ -178,7 +178,8 @@ def build_pulses_for_burst(tx_gpio: int, durations_us: List[int], carrier_khz: f
             remaining -= (t_on + t_off)
 
     def space(us: int):
-        pulses.append(pigpio.pulse(0, 0, max(1, int(us))))
+        pulses.append(pigpio.pulse(0, 1 << tx_gpio, max(1, int(us))))
+
 
     it = iter(durations_us)
     for on_dur in it:
@@ -206,6 +207,10 @@ def send_raw_burst(durations_us: List[int], carrier_khz: float):
     total = len(pulses)
     if IR_DEBUG:
         print(f"[send] durations={len(durations)} pulses={total}")
+
+    if IR_DEBUG:
+        print(f"Durations: {durations[:20]}")
+        print(f"First 10 pulses: {[ (p.gpio_on, p.gpio_off, p.delay) for p in pulses[:10] ]}")
 
     idx = 0
     while idx < total:
@@ -278,7 +283,21 @@ def learn_stop_and_save(remote: str, key: str):
         print(f"[learn] edges captured: {len(_learn_edges)}")
 
     # store as unsigned microseconds (send path accepts either)
-    burst = normalize_burst_us(_learn_edges)
+    raw_burst = _learn_edges
+
+    # Fix leading zero if present
+    if raw_burst and raw_burst[0] == 0:
+        raw_burst = raw_burst[1:]
+
+    # Normalize the full capture
+    normalized = normalize_burst_us(raw_burst)
+
+    # Only keep the first logical frame (split on gap_us)
+    first_frame = extract_first_frame_us(normalized, gap_us=7000)
+
+    # Store only the clean frame
+    burst = [abs(int(x)) for x in first_frame]
+
     db = _load_codes()
     db.setdefault(remote, {})[key] = [abs(int(x)) for x in burst]
     _save_codes(db)
