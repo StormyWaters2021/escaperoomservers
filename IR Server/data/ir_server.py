@@ -176,21 +176,34 @@ def build_pulses_for_burst(tx_gpio: int, durations_us: List[int], carrier_khz: f
 
     return pulses
 
-def send_raw_burst(durations_us: List[int], carrier_khz: float):
+def send_raw_burst(durations_us, carrier_khz: float):
+    """
+    Send a (possibly long) burst by splitting into multiple waves so we never exceed
+    pigpio wave limits (~12k pulses per wave). Ensures TX occurs even for huge frames.
+    """
     pi = get_pi()
     durations = normalize_burst_us(durations_us)
-    pulses = build_pulses_for_burst(IR_TX_GPIO, durations, carrier_khz)
+    all_pulses = build_pulses_for_burst(IR_TX_GPIO, durations, carrier_khz)
 
-    # Clear any pending transmission and send
-    _retry(lambda: (pi.wave_tx_stop(), pi.wave_clear()))
-    _retry(lambda: pi.wave_add_generic(pulses))
-    wid = _retry(lambda: pi.wave_create())
-    try:
-        _retry(lambda: pi.wave_send_once(wid))
-        while pi.wave_tx_busy():
-            time.sleep(0.0015)
-    finally:
-        _retry(lambda: pi.wave_delete(wid))
+    MAX_PULSES = 9000  # stay well under pigpio's limit
+    if IR_DEBUG:
+        print(f"[send] durations={len(durations)} pulses={len(all_pulses)} chunks={((len(all_pulses)-1)//MAX_PULSES)+1}")
+
+    idx = 0
+    while idx < len(all_pulses):
+        chunk = all_pulses[idx: idx + MAX_PULSES]
+        idx += len(chunk)
+
+        _retry(lambda: (pi.wave_tx_stop(), pi.wave_clear()))
+        _retry(lambda: pi.wave_add_generic(chunk))
+        wid = _retry(lambda: pi.wave_create())
+        try:
+            _retry(lambda: pi.wave_send_once(wid))
+            while pi.wave_tx_busy():
+                time.sleep(0.0015)
+        finally:
+            _retry(lambda: pi.wave_delete(wid))
+
 
 # ---- Learn (edge capture on RX) ----
 _learn_lock = threading.Lock()
@@ -408,3 +421,4 @@ def cogs_ir_delete(code_name: str):
         data.pop(remote, None)
     _save_codes(data)
     return {"ok": True, "deleted": f"{remote}/{key}"}
+
