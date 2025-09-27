@@ -218,46 +218,30 @@ def send_durations(durations: List[int], repeat: int, gap_us: int, carrier_khz: 
     if not durations:
         return
 
+    # Build frame once (ends LOW in build_wave_from_durations)
     frame_id = build_wave_from_durations(durations, TX_GPIO, carrier_khz)
-    gap_id = None
-    wave_ids = [frame_id]
-
     try:
-        chain = []
         rep = max(1, int(repeat))
-
         for i in range(rep):
-            chain += [255, 0, frame_id]
-            if gap_us > 0 and i < rep - 1:
-                if gap_us >= 1000:
-                    ms = int(round(gap_us / 1000.0))
-                    ms = max(1, min(ms, 65535))
-                    chain += [255, 1, (ms >> 8) & 0xFF, ms & 0xFF]
-                else:
-                    if gap_id is None:
-                        pi.wave_add_generic([pigpio.pulse(0, 1 << TX_GPIO, gap_us)])
-                        gap_id = pi.wave_create()
-                        if gap_id < 0:
-                            raise RuntimeError("gap wave_create failed")
-                        wave_ids.append(gap_id)
-                    chain += [255, 0, gap_id]
-
-        pi.wave_chain(chain)
-        while pi.wave_tx_busy():
-            time.sleep(0.002)
-
+            pi.wave_send_once(frame_id)
+            while pi.wave_tx_busy():
+                time.sleep(0.001)
+            if i < rep - 1 and gap_us > 0:
+                time.sleep(gap_us / 1_000_000.0)
     finally:
-        # NEW: belt-and-suspenders cleanup so TX is guaranteed low and pigpio isn't busy
         try:
             pi.wave_tx_stop()
         except pigpio.error:
             pass
-        pi.write(TX_GPIO, 0)
-        for wid in wave_ids:
-            try:
-                pi.wave_delete(wid)
-            except pigpio.error:
-                pass
+        pi.write(TX_GPIO, 0)    # hard force LOW
+        try:
+            pi.wave_delete(frame_id)
+        except pigpio.error:
+            pass
+        try:
+            pi.wave_clear()     # release any lingering wave resources
+        except pigpio.error:
+            pass
 
 # =========================
 # Simple helper: parse "ms" CSV into ints
@@ -401,6 +385,19 @@ def delete_get(name: str = Query(...)):
     os.remove(path)
     return {"ok": True, "deleted": name}
 
+@app.get("/cogs/ir/stop")
+def stop_tx():
+    try:
+        pi.wave_tx_stop()
+    except pigpio.error:
+        pass
+    pi.write(TX_GPIO, 0)
+    try:
+        pi.wave_clear()
+    except pigpio.error:
+        pass
+    return {"ok": True, "stopped": True}
+
 # =========================
 # Graceful shutdown
 # =========================
@@ -426,5 +423,6 @@ signal.signal(signal.SIGINT, handle_sigterm)
 # =========================
 if __name__ == "__main__":
     uvicorn.run("ir_server:app", host="0.0.0.0", port=8001, reload=False)
+
 
 
