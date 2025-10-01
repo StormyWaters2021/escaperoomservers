@@ -8,7 +8,7 @@ Notes
 - Names in URLs can use underscores "_" instead of spaces. The server converts "_" -> " ".
 - Uses Hue v1 local API. Press the bridge's LINK button before calling /hue/register/ip/{ip}.
 """
-import os, json
+import os, json, time
 from typing import Dict, Any, Optional
 import requests
 from fastapi import FastAPI, HTTPException
@@ -20,7 +20,7 @@ CFG_PATH = os.environ.get("HUE_CONFIG", "/opt/hue-server/hue_config.json")
 REQUEST_TIMEOUT = float(os.environ.get("HUE_TIMEOUT", "3.0"))
 DEVICETYPE = "hue-server#pi"  # registration identifier
 
-app = FastAPI(title=APP_TITLE, version="1.0")
+app = FastAPI(title=APP_TITLE, version="1.1")
 
 # ---------- Config helpers ----------
 def _ensure_cfg_dir():
@@ -87,23 +87,53 @@ def _get_light_state(cfg, light_id: str) -> Optional[bool]:
     data = hue_get(cfg, f"/lights/{light_id}")
     return bool(data.get("state", {}).get("on"))
 
+def _confirm_state(cfg, light_id: str, want_on: bool, retries: int = 5, delay_s: float = 0.1) -> bool:
+    """
+    Poll the bridge briefly to confirm the on/off state after a write.
+    Hue can be eventually consistent; this gives a fast, lightweight confirmation.
+    """
+    for _ in range(max(1, retries)):
+        try:
+            is_on = _get_light_state(cfg, light_id)
+            if is_on == want_on:
+                return True
+        except Exception:
+            pass
+        time.sleep(delay_s)
+    return False
+
 # ---------- COGS PATH ENDPOINTS (GET-only, no query strings) ----------
 @app.get("/cogs/health")
 def cogs_health():
     cfg = load_cfg()
     return {"status": "ok", "bridge_ip": cfg.get("bridge_ip", ""), "mapped": len(cfg.get("map", {}))}
 
+@app.get("/cogs/hue/state/{name}")
+def cogs_hue_state(name: str):
+    """
+    Read the actual on/off state by friendly name (underscores allowed in path).
+    Returns: {"ok": true, "name": "...", "light_id": "X", "on": true/false}
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+    on = _get_light_state(cfg, lid)
+    return {"ok": True, "name": _norm_name(name), "light_id": lid, "on": bool(on)}
+
 @app.get("/cogs/hue/on/{name}")
 def cogs_hue_on(name: str):
     cfg = load_cfg(); require_bridge(cfg)
     lid = _resolve_light_id_by_name(cfg, name)
-    return _set_on_state(cfg, lid, True)
+    _set_on_state(cfg, lid, True)
+    confirmed = _confirm_state(cfg, lid, True)
+    return {"ok": True, "light_id": lid, "on": True, "confirmed": bool(confirmed)}
 
 @app.get("/cogs/hue/off/{name}")
 def cogs_hue_off(name: str):
     cfg = load_cfg(); require_bridge(cfg)
     lid = _resolve_light_id_by_name(cfg, name)
-    return _set_on_state(cfg, lid, False)
+    _set_on_state(cfg, lid, False)
+    confirmed = _confirm_state(cfg, lid, False)
+    return {"ok": True, "light_id": lid, "on": False, "confirmed": bool(confirmed)}
 
 # ---------- Local admin PATH endpoints ----------
 @app.get("/hue/register/ip/{ip}")
@@ -193,6 +223,7 @@ def root():
         "service": "hue-server-pathonly",
         "cogs": [
             "/cogs/health",
+            "/cogs/hue/state/{Name_or_Name_With_Underscores}",
             "/cogs/hue/on/{Name_or_Name_With_Underscores}",
             "/cogs/hue/off/{Name_or_Name_With_Underscores}",
         ],
@@ -204,6 +235,7 @@ def root():
             "/hue/unmap/{name}",
             "/hue/mappings",
             "/hue/mappings/txt",
+            "/hue/map/all",
         ],
     }
 
