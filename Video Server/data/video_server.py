@@ -277,8 +277,8 @@ class VideoController:
             "--really-quiet",
             "--log-file=" + log_path,
             "--ao=alsa",
-            "--audio-device=alsa/plughw:CARD=wm8960soundcard,DEV=0",
-            # "--audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0", # One HDMI port
+            # "--audio-device=alsa/plughw:CARD=wm8960soundcard,DEV=0",
+            "--audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0", # One HDMI port
             # "--audio-device=alsa/hdmi:CARD=vc4hdmi1,DEV=0", # Other HDMI port
             
         ]
@@ -1320,3 +1320,4 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
