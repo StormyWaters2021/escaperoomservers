@@ -892,6 +892,75 @@ class VideoController:
         t.start()
 
 
+    def audio_overlay_smart_start_single(self, path: str, volume: Optional[int] = None, grace: float = 0.35):
+        """Single-file loop variant:
+        - If audio fits into current remaining time, attach now.
+        - Else restart the same video from t=0 and then attach.
+        No persistent state; no reattach on subsequent loops.
+        """
+        import json, subprocess, os, time
+
+        def _get_time_remaining() -> float:
+            try:
+                rem = self.mpv.get_property("time-remaining")
+                if rem is not None:
+                    return max(0.0, float(rem))
+            except Exception:
+                pass
+            try:
+                dur = float(self.mpv.get_property("duration") or 0.0)
+                pos = float(self.mpv.get_property("time-pos") or 0.0)
+                return max(0.0, dur - pos)
+            except Exception:
+                return 0.0
+
+        def _audio_duration(p: str) -> float:
+            try:
+                out = subprocess.check_output(
+                    ["ffprobe","-v","error","-show_entries","format=duration","-of","json", p],
+                    stderr=subprocess.STDOUT, text=True
+                )
+                return max(0.0, float(json.loads(out)["format"]["duration"]))
+            except Exception:
+                return 0.0  # unknown -> treat as "fits"
+
+        abs_path = os.path.abspath(path)
+        remaining = _get_time_remaining()
+        audio_dur = _audio_duration(abs_path)
+
+        if audio_dur <= (remaining + float(grace)) or audio_dur == 0.0:
+            if volume is not None:
+                try:
+                    self.mpv.set_property("volume", int(volume))
+                except Exception:
+                    pass
+            self.mpv.command("audio-add", abs_path, "select")
+            return {"action": "attach_now", "audio_duration": audio_dur, "time_remaining": remaining}
+
+        # Doesn't fit: restart same file at t=0, then attach (avoids crossing the loop boundary).
+        try:
+            self.mpv.command("seek", 0, "absolute", "exact")
+        except Exception:
+            cur_path = self.mpv.get_property("path")
+            if cur_path:
+                try:
+                    self.mpv.command("loadfile", cur_path, "replace")
+                except Exception:
+                    pass
+
+        time.sleep(0.02)
+
+        if volume is not None:
+            try:
+                self.mpv.set_property("volume", int(volume))
+            except Exception:
+                pass
+        self.mpv.command("audio-add", abs_path, "select")
+
+        new_remaining = _get_time_remaining()
+        return {"action": "restart_then_attach", "audio_duration": audio_dur,
+                "time_remaining": remaining, "new_time_remaining": new_remaining}
+
 
 # ======== HTTP API ========
 
@@ -1307,6 +1376,35 @@ def cogs_overlay_path(rotate_deg: int, align: str, margin_x: int, margin_y: int,
 
 # ======== Entrypoint ========
 
+@app.get("/cogs/audio/overlay/smart_start_single")
+def cogs_audio_overlay_smart_start_single_get(path: str, volume: Optional[int] = None, grace: float = 0.35):
+    if not path:
+        raise HTTPException(400, "missing 'path'")
+    with _controller_lock:
+        if not _controller:
+            raise HTTPException(500, "Controller not initialized")
+        result = _controller.audio_overlay_smart_start_single(
+            path, volume=None if volume is None else int(volume), grace=float(grace)
+        )
+    return {"ok": True, **result}
+
+@app.post("/cogs/audio/overlay/smart_start_single")
+async def cogs_audio_overlay_smart_start_single_post(request: Request):
+    d = await _parse_noheader_body(request)
+    path = (d.get("path") or "").strip()
+    if not path:
+        raise HTTPException(400, "missing 'path'")
+    volume = d.get("volume")
+    grace = float(d.get("grace", 0.35))
+    with _controller_lock:
+        if not _controller:
+            raise HTTPException(500, "Controller not initialized")
+        result = _controller.audio_overlay_smart_start_single(
+            path, volume=None if volume in (None, "") else int(volume), grace=grace
+        )
+    return {"ok": True, **result}
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Looping video server with interrupt, overlays, and countdown timer (mpv + HTTP API)")
     ap.add_argument("--main", help="Path to main looping video (optional at startup)")
@@ -1320,4 +1418,5 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
 
