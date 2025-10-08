@@ -199,6 +199,49 @@ class VideoController:
         self._msg_ovl_id = 701         # separate from the timer’s ID (700)
         self._msg_remove_timer = None   # threading.Timer handle
         #self.timer = CountdownTimer(self.mpv)
+        # Overlay restore state
+        self._overlay_restore_timer = None
+        self._orig_audio_id = None
+
+    def _get_selected_audio_track_id(self) -> int | None:
+        """Return the mpv track id of the currently selected audio track, or None."""
+        try:
+            tracks = self.mpv.get_property("track-list") or []
+            for t in tracks:
+                if t.get("type") == "audio" and t.get("selected"):
+                    return t.get("id")
+        except Exception:
+            pass
+        return None
+
+    def _schedule_restore_original_audio(self, delay_s: float):
+        """After delay_s, switch audio back to the original track id (if known)."""
+        import threading, time
+        # cancel any existing timer
+        try:
+            if self._overlay_restore_timer and self._overlay_restore_timer.is_alive():
+                # best effort: no cancel on Timer, so we just let it finish; we’ll replace the ref
+                pass
+        except Exception:
+            pass
+        def _restore():
+            try:
+                time.sleep(max(0.0, float(delay_s)))
+                # If we remembered a specific id, restore it. Otherwise fall back to 'auto'
+                if self._orig_audio_id is not None:
+                    self.mpv.set_property("audio", self._orig_audio_id)
+                else:
+                    self.mpv.set_property("audio", "auto")
+                # Optional: clear external audio list to keep things tidy
+                try:
+                    self.mpv.set_property("audio-files", [])
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._overlay_restore_timer = threading.Thread(target=_restore, daemon=True)
+        self._overlay_restore_timer.start()
+
 
     def _osd_map_xy_for_rotation(self, x_px: int, y_px: int) -> Tuple[int, int]:
         """Map desired on-screen (viewer) coords to mpv's pre-rotation OSD coords."""
@@ -264,7 +307,7 @@ class VideoController:
             "--loop-playlist=no",
             "--hwdec=drm",
             "--vo=gpu",
-            "--video-rotate=90",
+            "--video-rotate=0",
             "--gpu-context=drm",
             "--interpolation=no",
             "--video-sync=audio",
@@ -899,7 +942,9 @@ class VideoController:
         No persistent state; no reattach on subsequent loops.
         """
         import json, subprocess, os, time
-
+        
+        self._orig_audio_id = self._get_selected_audio_track_id()
+        
         def _get_time_remaining() -> float:
             try:
                 rem = self.mpv.get_property("time-remaining")
@@ -935,6 +980,9 @@ class VideoController:
                 except Exception:
                     pass
             self.mpv.command("audio-add", abs_path, "select")
+            if audio_dur > 0.0:
+                self._schedule_restore_original_audio(audio_dur)
+            
             return {"action": "attach_now", "audio_duration": audio_dur, "time_remaining": remaining}
 
         # Doesn't fit: restart same file at t=0, then attach (avoids crossing the loop boundary).
@@ -957,7 +1005,10 @@ class VideoController:
                 pass
         self.mpv.command("audio-add", abs_path, "select")
 
+        
         new_remaining = _get_time_remaining()
+        if audio_dur > 0.0:
+            self._schedule_restore_original_audio(audio_dur)        
         return {"action": "restart_then_attach", "audio_duration": audio_dur,
                 "time_remaining": remaining, "new_time_remaining": new_remaining}
 
@@ -1418,5 +1469,6 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
 
 
