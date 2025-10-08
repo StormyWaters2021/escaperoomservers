@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+[ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
+
 set -euo pipefail
 
 ### ------------ Config (no git pulls here) ------------
@@ -10,7 +12,7 @@ PORT="${PORT:-8000}"
 # Use the repo that was cloned by the master installer
 REPO_ROOT="${ESCAPEROOM_REPO_DIR:-/opt/escaperoomservers/repo}"
 
-+APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
+APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
 PIP_PKGS=(fastapi "uvicorn[standard]" python-mpv pydantic requests)
 
 # Choose the service user
