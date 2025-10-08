@@ -961,6 +961,7 @@ class AudioController:
                 "--input-ipc-server=" + self.sock_path,
                 "--idle=yes",      # stay alive between tracks
                 "--keep-open=yes", # do not exit between files
+                "--ao=alsa",
             ]
             if video_device:
                 cmd.append(f"--audio-device={video_device}")
@@ -982,6 +983,7 @@ class AudioController:
             print(f"[audio] failed to adopt video device at runtime: {e}")
 
         # Clear any inherited pause state, then load and play
+        self._ipc(["set_property", "mute", False])
         self._ipc(["set_property", "pause", False])
         self._ipc(["loadfile", abs_path, "replace"])
 
@@ -994,6 +996,7 @@ class AudioController:
             self._ipc(["set_property", "volume", v])
 
         # ensure playing (twice to beat timing races on some builds)
+        self._ipc(["set_property", "mute", False])
         self._ipc(["set_property", "pause", False])
         time.sleep(0.02)
         self._ipc(["set_property", "pause", False])
@@ -1042,6 +1045,7 @@ class AudioController:
                     "--input-ipc-server=" + self.sock_path,
                     "--idle=yes",
                     "--keep-open=yes",
+                    "--ao=alsa",
                 ]
                 if video_device:
                     cmd.append(f"--audio-device={video_device}")
