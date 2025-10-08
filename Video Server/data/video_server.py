@@ -917,33 +917,8 @@ class AudioController:
         return self.proc is not None and self.proc.poll() is None
 
     def ensure_running(self):
-        """Start the audio-only mpv in idle mode if it's not running yet."""
-        if self._is_running():
-            return
-        try:
-            if os.path.exists(self.sock_path):
-                os.remove(self.sock_path)
-        except Exception:
-            pass
-
-        cmd = [
-            "mpv", "--no-video",
-            "--input-ipc-server=" + self.sock_path,
-            "--idle=yes", 
-            "--keep-open=yes",
-            "--title=AUDIO_MPV",
-            "--reset-on-next-file=all",
-            "--loop-file=no",
-            "--loop-playlist=no",
-            "--ao=pulse",
-            f"--log-file={self.log_path}",
-            "--really-quiet",
-        ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not self._wait_for_socket(3.0):
-            raise RuntimeError("audio mpv failed to start")
-
-
+        """(No-op in one-shot mode) Kept for compatibility with callers."""
+        return
 
     def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
         t0 = time.monotonic()
@@ -1005,62 +980,57 @@ class AudioController:
         if not os.path.isfile(abs_path):
             raise RuntimeError(f"Audio file not found: {abs_path}")
 
-        # ensure mpv exists (idle) and adopts the video device
-        self.ensure_running()
+        # Stop any previous overlay process
+        if self._is_running():
+            self.stop()
 
-
-        # Clear any inherited pause state, then load and play
-        self._ipc(["set_property", "mute", False])
-        self._ipc(["set_property", "pause", False])
-        
-        # sanity: refuse to play on the VIDEO instance by mistake
+        # Fresh socket each time (avoid races with old instance)
         try:
-            wt = self._ipc(["get_property", "window-title"]).get("data")
-            if wt and "VIDEO_MPV" in str(wt):
-                raise RuntimeError("Audio endpoint is connected to the VIDEO mpv socket")
+            if os.path.exists(self.sock_path):
+                os.remove(self.sock_path)
         except Exception:
             pass
-        
-        # ensure NO loop by default, then load
-        self._ipc(["set_property", "loop-file", "no"])
-        self._ipc(["set_property", "loop-playlist", "no"])
-        resp = self._ipc(["loadfile", abs_path, "replace"])
-        # Some mpv builds send no immediate reply for 'loadfile'. If we didn't get an explicit
-        # error, proceed and verify playback via idle/filename below.
-        if resp.get("error") not in (None, "success"):
-            raise RuntimeError(f"mpv loadfile failed: {resp}")
 
-        # loop setting (default: NO loop)
-        if loop:
-            self._ipc(["set_property", "loop-file", "inf"])
-        else:
-            self._ipc(["set_property", "loop-file", "no"])
-            self._ipc(["set_property", "loop-playlist", "no"])
-
-        # volume
+        # Build one-shot command
+        cmd = [
+            "mpv", "--no-video",
+            f"--input-ipc-server={self.sock_path}",
+            "--idle=no",               # exit when file ends
+            "--keep-open=no",          # fully close after play
+            "--title=AUDIO_MPV",
+            "--reset-on-next-file=all",
+            "--loop-file=no",
+            "--loop-playlist=no",
+            "--ao=pulse",
+            f"--log-file={self.log_path}",
+            "--really-quiet",
+        ]
+        # Volume as a startup flag so it applies before playback begins
         if volume is not None:
             v = max(0, min(100, int(volume)))
-            self._ipc(["set_property", "volume", v])
+            cmd.append(f"--volume={v}")
+        # Loop if explicitly requested
+        if loop:
+            cmd.append("--loop-file=inf")
+        # Append the file to play
+        cmd.append(abs_path)
 
-        # ensure playing (twice to beat timing races on some builds)
-        self._ipc(["set_property", "mute", False])
-        self._ipc(["set_property", "pause", False])
-        time.sleep(0.02)
-        self._ipc(["set_property", "pause", False])
-        self._ipc(["set_property", "mute", False])
+        # Launch
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Optional: brief check that the socket appears (not strictly required for one-shot)
+        self._wait_for_socket(1.0)
 
-        # wait briefly until the file is actually active
-        if not self._wait_until_playing(timeout_s=5.0):
-            # Let the caller know; /tmp/mpv-audio.log will have the reason
-            raise RuntimeError("audio did not start (still idle)")
 
     def stop(self):
         if not self._is_running():
+            # still clear stale socket if left behind
+            try:
+                if os.path.exists(self.sock_path):
+                    os.remove(self.sock_path)
+            except Exception:
+                pass
             return
-        try:
-            self._ipc(["quit"])
-        except Exception:
-            pass
+        try: self._ipc(["quit"]);  except Exception: pass
         try:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
@@ -1072,6 +1042,7 @@ class AudioController:
                 os.remove(self.sock_path)
         except Exception:
             pass
+
 
     def set_volume(self, volume: int):
         if not self._is_running():
