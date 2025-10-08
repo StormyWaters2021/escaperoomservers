@@ -10,7 +10,7 @@ PORT="${PORT:-8000}"
 # Use the repo that was cloned by the master installer
 REPO_ROOT="${ESCAPEROOM_REPO_DIR:-/opt/escaperoomservers/repo}"
 
-+APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
+APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
 PIP_PKGS=(fastapi "uvicorn[standard]" python-mpv pydantic requests)
 
 # Choose the service user
@@ -210,3 +210,4 @@ case "${1:-install}" in
   install) cmd_install;;
   *) echo "Usage: $0 [install]"; exit 1;;
 esac
+
