@@ -9,6 +9,10 @@ except Exception:
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+VIDEO_SOCK = "/tmp/mpv-video.sock"
+AUDIO_SOCK = "/tmp/mpv-audio.sock"
+
+
 def _first(v):
     # flatten values that may come from parse_qs
     if isinstance(v, (list, tuple)):
@@ -177,7 +181,7 @@ class MPVIPC:
 
 class VideoController:
     def __init__(self, main_path: Optional[str], fullscreen: bool):
-        self.socket_path = "/tmp/mpv-video.sock"
+        self.socket_path = VIDEO_SOCK
         self.main_path = os.path.abspath(main_path) if main_path else None
         self._proc = None
         self.mpv = None
@@ -254,6 +258,7 @@ class VideoController:
             "--idle=yes",
             "--force-window=yes",
             "--keep-open=no",
+            "--title=VIDEO_MPV",
             "--cache=no",
             "--reset-on-next-file=all",
             "--osc=no",
@@ -893,7 +898,7 @@ _controller_lock = threading.Lock()
 # Audio-only MPV Controller
 # =========================
 class AudioController:
-    def __init__(self, sock_path: str = "/tmp/mpv-audio.sock"):
+    def __init__(self, sock_path: str = AUDIO_SOCK):
         self.sock_path = sock_path
         self.proc: Optional[subprocess.Popen] = None
         self.log_path = "/tmp/mpv-audio.log"
@@ -915,7 +920,11 @@ class AudioController:
         cmd = [
             "mpv", "--no-video",
             "--input-ipc-server=" + self.sock_path,
-            "--idle=yes", "--keep-open=yes",
+            "--idle=yes", 
+            "--keep-open=yes",
+            "--title=AUDIO_MPV",
+            "--reset-on-next-file=all",
+            "--loop-file=no",
             "--ao=pulse",
             f"--log-file={self.log_path}",
             "--really-quiet",
@@ -993,14 +1002,24 @@ class AudioController:
         # Clear any inherited pause state, then load and play
         self._ipc(["set_property", "mute", False])
         self._ipc(["set_property", "pause", False])
-        # load file and validate mpv accepted it
+        
+        # sanity: refuse to play on the VIDEO instance by mistake
+        try:
+            wt = self._ipc(["get_property", "window-title"]).get("data")
+            if wt and "VIDEO_MPV" in str(wt):
+                raise RuntimeError("Audio endpoint is connected to the VIDEO mpv socket")
+        except Exception:
+            pass
+        
+        # ensure loop is off by default, then load
+        self._ipc(["set_property", "loop-file", "no"])
         resp = self._ipc(["loadfile", abs_path, "replace"])
         # Some mpv builds send no immediate reply for 'loadfile'. If we didn't get an explicit
         # error, proceed and verify playback via idle/filename below.
         if resp.get("error") not in (None, "success"):
             raise RuntimeError(f"mpv loadfile failed: {resp}")
 
-        # loop setting
+        # loop setting (default: no loop)
         self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
 
         # volume
@@ -1016,7 +1035,7 @@ class AudioController:
         self._ipc(["set_property", "mute", False])
 
         # wait briefly until the file is actually active
-        if not self._wait_until_playing(timeout_s=2.0):
+        if not self._wait_until_playing(timeout_s=5.0):
             # Let the caller know; /tmp/mpv-audio.log will have the reason
             raise RuntimeError("audio did not start (still idle)")
 
