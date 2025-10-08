@@ -9,7 +9,6 @@ except Exception:
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi import Request
-import socket, subprocess, os, time, json, threading
 
 def _first(v):
     # flatten values that may come from parse_qs
@@ -200,49 +199,6 @@ class VideoController:
         self._msg_ovl_id = 701         # separate from the timer’s ID (700)
         self._msg_remove_timer = None   # threading.Timer handle
         #self.timer = CountdownTimer(self.mpv)
-        # Overlay restore state
-        self._overlay_restore_timer = None
-        self._orig_audio_id = None
-
-    def _get_selected_audio_track_id(self) -> int | None:
-        """Return the mpv track id of the currently selected audio track, or None."""
-        try:
-            tracks = self.mpv.get_property("track-list") or []
-            for t in tracks:
-                if t.get("type") == "audio" and t.get("selected"):
-                    return t.get("id")
-        except Exception:
-            pass
-        return None
-
-    def _schedule_restore_original_audio(self, delay_s: float):
-        """After delay_s, switch audio back to the original track id (if known)."""
-        import threading, time
-        # cancel any existing timer
-        try:
-            if self._overlay_restore_timer and self._overlay_restore_timer.is_alive():
-                # best effort: no cancel on Timer, so we just let it finish; we’ll replace the ref
-                pass
-        except Exception:
-            pass
-        def _restore():
-            try:
-                time.sleep(max(0.0, float(delay_s)))
-                # If we remembered a specific id, restore it. Otherwise fall back to 'auto'
-                if self._orig_audio_id is not None:
-                    self.mpv.set_property("audio", self._orig_audio_id)
-                else:
-                    self.mpv.set_property("audio", "auto")
-                # Optional: clear external audio list to keep things tidy
-                try:
-                    self.mpv.set_property("audio-files", [])
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        self._overlay_restore_timer = threading.Thread(target=_restore, daemon=True)
-        self._overlay_restore_timer.start()
-
 
     def _osd_map_xy_for_rotation(self, x_px: int, y_px: int) -> Tuple[int, int]:
         """Map desired on-screen (viewer) coords to mpv's pre-rotation OSD coords."""
@@ -308,7 +264,7 @@ class VideoController:
             "--loop-playlist=no",
             "--hwdec=drm",
             "--vo=gpu",
-            "--video-rotate=0",
+            "--video-rotate=90",
             "--gpu-context=drm",
             "--interpolation=no",
             "--video-sync=audio",
@@ -936,214 +892,12 @@ class VideoController:
         t.start()
 
 
-    def audio_overlay_smart_start_single(self, path: str, volume: Optional[int] = None, grace: float = 0.35):
-        """Single-file loop variant:
-        - If audio fits into current remaining time, attach now.
-        - Else restart the same video from t=0 and then attach.
-        No persistent state; no reattach on subsequent loops.
-        """
-        import json, subprocess, os, time
-        
-        self._orig_audio_id = self._get_selected_audio_track_id()
-        
-        def _get_time_remaining() -> float:
-            try:
-                rem = self.mpv.get_property("time-remaining")
-                if rem is not None:
-                    return max(0.0, float(rem))
-            except Exception:
-                pass
-            try:
-                dur = float(self.mpv.get_property("duration") or 0.0)
-                pos = float(self.mpv.get_property("time-pos") or 0.0)
-                return max(0.0, dur - pos)
-            except Exception:
-                return 0.0
-
-        def _audio_duration(p: str) -> float:
-            try:
-                out = subprocess.check_output(
-                    ["ffprobe","-v","error","-show_entries","format=duration","-of","json", p],
-                    stderr=subprocess.STDOUT, text=True
-                )
-                return max(0.0, float(json.loads(out)["format"]["duration"]))
-            except Exception:
-                return 0.0  # unknown -> treat as "fits"
-
-        abs_path = os.path.abspath(path)
-        remaining = _get_time_remaining()
-        audio_dur = _audio_duration(abs_path)
-
-        if audio_dur <= (remaining + float(grace)) or audio_dur == 0.0:
-            if volume is not None:
-                try:
-                    self.mpv.set_property("volume", int(volume))
-                except Exception:
-                    pass
-            self.mpv.command("audio-add", abs_path, "select")
-            if audio_dur > 0.0:
-                self._schedule_restore_original_audio(audio_dur)
-            
-            return {"action": "attach_now", "audio_duration": audio_dur, "time_remaining": remaining}
-
-        # Doesn't fit: restart same file at t=0, then attach (avoids crossing the loop boundary).
-        try:
-            self.mpv.command("seek", 0, "absolute", "exact")
-        except Exception:
-            cur_path = self.mpv.get_property("path")
-            if cur_path:
-                try:
-                    self.mpv.command("loadfile", cur_path, "replace")
-                except Exception:
-                    pass
-
-        time.sleep(0.02)
-
-        if volume is not None:
-            try:
-                self.mpv.set_property("volume", int(volume))
-            except Exception:
-                pass
-        self.mpv.command("audio-add", abs_path, "select")
-
-        
-        new_remaining = _get_time_remaining()
-        if audio_dur > 0.0:
-            self._schedule_restore_original_audio(audio_dur)        
-        return {"action": "restart_then_attach", "audio_duration": audio_dur,
-                "time_remaining": remaining, "new_time_remaining": new_remaining}
-
 
 # ======== HTTP API ========
 
 app = FastAPI()
 _controller: Optional[VideoController] = None
 _controller_lock = threading.Lock()
-
-# =========================
-# Audio-only MPV Controller
-# =========================
-class AudioController:
-    def __init__(self, sock_path: str = "/tmp/mpv-audio.sock"):
-        self.sock_path = sock_path
-        self.proc: Optional[subprocess.Popen] = None
-
-    # ---- process helpers ----
-    def _is_running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
-
-    def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout_s:
-            if os.path.exists(self.sock_path):
-                try:
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                        s.settimeout(0.2)
-                        s.connect(self.sock_path)
-                        return True
-                except Exception:
-                    pass
-            time.sleep(0.03)
-        return False
-
-    def _ipc(self, cmd: list) -> Dict[str, Any]:
-        """Send a JSON-IPC command and return mpv's response (or {})."""
-        payload = (json.dumps({"command": cmd}) + "\n").encode("utf-8")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            s.connect(self.sock_path)
-            s.sendall(payload)
-            data = b""
-            # read one line
-            while not data.endswith(b"\n"):
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-        try:
-            return json.loads(data.decode("utf-8"))
-        except Exception:
-            return {}
-
-    # ---- public controls ----
-    def start(self, path: str, volume: Optional[int] = None, loop: bool = False):
-        abs_path = os.path.abspath(path)
-        if not os.path.isfile(abs_path):
-            raise RuntimeError(f"Audio file not found: {abs_path}")
-        # spin up mpv --no-video if not running
-        if not self._is_running():
-            # remove stale socket if present
-            try:
-                if os.path.exists(self.sock_path):
-                    os.remove(self.sock_path)
-            except Exception:
-                pass
-            self.proc = subprocess.Popen([
-                "mpv",
-                "--no-video",
-                "--input-ipc-server=" + self.sock_path,
-                "--idle=yes",           # stay alive between tracks
-                "--keep-open=yes",
-                "--really-quiet"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if not self._wait_for_socket(3.0):
-                raise RuntimeError("audio mpv failed to start")
-        # load the file
-        self._ipc(["loadfile", abs_path, "replace"])
-        # loop setting
-        self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
-        # volume
-        if volume is not None:
-            v = max(0, min(100, int(volume)))
-            self._ipc(["set_property", "volume", v])
-        # ensure playing
-        self._ipc(["set_property", "pause", False])
-
-    def stop(self):
-        if not self._is_running():
-            return
-        try:
-            self._ipc(["quit"])
-        except Exception:
-            pass
-        try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-        except Exception:
-            pass
-        self.proc = None
-        try:
-            if os.path.exists(self.sock_path):
-                os.remove(self.sock_path)
-        except Exception:
-            pass
-
-    def set_volume(self, volume: int):
-        if not self._is_running():
-            raise RuntimeError("audio not running")
-        v = max(0, min(100, int(volume)))
-        self._ipc(["set_property", "volume", v])
-
-    def status(self) -> Dict[str, Any]:
-        if not self._is_running():
-            return {"running": False}
-        # pull a few properties (best-effort)
-        resp = {
-            "running": True,
-            "volume": None,
-            "pause": None,
-            "filename": None,
-        }
-        try:
-            resp["volume"] = self._ipc(["get_property", "volume"]).get("data")
-            resp["pause"] = self._ipc(["get_property", "pause"]).get("data")
-            resp["filename"] = self._ipc(["get_property", "filename"]).get("data")
-        except Exception:
-            pass
-        return resp
-
-# single instance
-_audio = AudioController()
 
 # --- Error helpers & debug utilities ---
 logging.basicConfig(level=logging.INFO)
@@ -1550,65 +1304,8 @@ def cogs_overlay_path(rotate_deg: int, align: str, margin_x: int, margin_y: int,
         )
     return {"ok": True}
 
-@app.get("/cogs/audio/play")
-def cogs_audio_play(path: str, volume: Optional[int] = None, loop: int = 0):
-    try:
-        _audio.start(path, volume=None if volume is None else int(volume), loop=bool(int(loop)))
-        return {"ok": True}
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))
-    except Exception:
-        raise HTTPException(500, "failed to start audio")
-
-@app.get("/cogs/audio/stop")
-def cogs_audio_stop():
-    _audio.stop()
-    return {"ok": True}
-
-@app.get("/cogs/audio/status")
-def cogs_audio_status():
-    return {"ok": True, **_audio.status()}
-
-@app.get("/cogs/audio/volume")
-def cogs_audio_volume(volume: int):
-    try:
-        _audio.set_volume(int(volume))
-        return {"ok": True, "volume": int(volume)}
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))
-    except Exception:
-        raise HTTPException(500, "failed to set volume")
 
 # ======== Entrypoint ========
-
-@app.get("/cogs/audio/overlay/smart_start_single")
-def cogs_audio_overlay_smart_start_single_get(path: str, volume: Optional[int] = None, grace: float = 0.35):
-    if not path:
-        raise HTTPException(400, "missing 'path'")
-    with _controller_lock:
-        if not _controller:
-            raise HTTPException(500, "Controller not initialized")
-        result = _controller.audio_overlay_smart_start_single(
-            path, volume=None if volume is None else int(volume), grace=float(grace)
-        )
-    return {"ok": True, **result}
-
-@app.post("/cogs/audio/overlay/smart_start_single")
-async def cogs_audio_overlay_smart_start_single_post(request: Request):
-    d = await _parse_noheader_body(request)
-    path = (d.get("path") or "").strip()
-    if not path:
-        raise HTTPException(400, "missing 'path'")
-    volume = d.get("volume")
-    grace = float(d.get("grace", 0.35))
-    with _controller_lock:
-        if not _controller:
-            raise HTTPException(500, "Controller not initialized")
-        result = _controller.audio_overlay_smart_start_single(
-            path, volume=None if volume in (None, "") else int(volume), grace=grace
-        )
-    return {"ok": True, **result}
-
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Looping video server with interrupt, overlays, and countdown timer (mpv + HTTP API)")
@@ -1623,7 +1320,3 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
-
-
-
-
