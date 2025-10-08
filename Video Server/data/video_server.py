@@ -895,6 +895,7 @@ class AudioController:
     def __init__(self, sock_path: str = "/tmp/mpv-audio.sock"):
         self.sock_path = sock_path
         self.proc: Optional[subprocess.Popen] = None
+        self.log_path = "/tmp/mpv-audio.log"
 
     # ---- process helpers ----
     def _is_running(self) -> bool:
@@ -924,6 +925,7 @@ class AudioController:
             "--idle=yes",
             "--keep-open=yes",
             "--ao=alsa",
+            f"--log-file={self.log_path}",
             "--really-quiet",
         ]
         if video_device:
@@ -965,6 +967,24 @@ class AudioController:
         except Exception:
             return {}
 
+    def _get(self, prop: str):
+        try:
+            return self._ipc(["get_property", prop]).get("data")
+        except Exception:
+            return None
+
+    def _wait_until_playing(self, timeout_s: float = 2.0) -> bool:
+        """Return True once a file is active (idle-active == False and filename present)."""
+        import time as _t
+        t0 = _t.monotonic()
+        while _t.monotonic() - t0 < timeout_s:
+            idle = self._get("idle-active")
+            fname = self._get("filename")
+            if idle is False and fname:
+                return True
+            _t.sleep(0.05)
+        return False
+
     # ---- public controls ----
     def start(self, path: str, volume: Optional[int] = None, loop: bool = False):
         abs_path = os.path.abspath(path)
@@ -986,7 +1006,10 @@ class AudioController:
         # Clear any inherited pause state, then load and play
         self._ipc(["set_property", "mute", False])
         self._ipc(["set_property", "pause", False])
-        self._ipc(["loadfile", abs_path, "replace"])
+        # load file and validate mpv accepted it
+        resp = self._ipc(["loadfile", abs_path, "replace"])
+        if resp.get("error") != "success":
+            raise RuntimeError(f"mpv loadfile failed: {resp}")
 
         # loop setting
         self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
@@ -1001,6 +1024,12 @@ class AudioController:
         self._ipc(["set_property", "pause", False])
         time.sleep(0.02)
         self._ipc(["set_property", "pause", False])
+        self._ipc(["set_property", "mute", False])
+
+        # wait briefly until the file is actually active
+        if not self._wait_until_playing(timeout_s=2.0):
+            # Let the caller know; /tmp/mpv-audio.log will have the reason
+            raise RuntimeError("audio did not start (still idle)")
 
     def stop(self):
         if not self._is_running():
@@ -1041,11 +1070,12 @@ class AudioController:
     def status(self) -> Dict[str, Any]:
         if not self._is_running():
             return {"running": False}
-        resp: Dict[str, Any] = {"running": True, "volume": None, "pause": None, "filename": None}
+        resp: Dict[str, Any] = {"running": True, "volume": None, "pause": None, "filename": None, "idle_active": None}
         try:
             resp["volume"] = self._ipc(["get_property", "volume"]).get("data")
             resp["pause"] = self._ipc(["get_property", "pause"]).get("data")
             resp["filename"] = self._ipc(["get_property", "filename"]).get("data")
+            resp["idle_active"] = self._ipc(["get_property", "idle-active"]).get("data")
         except Exception:
             pass
         return resp
