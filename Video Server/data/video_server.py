@@ -271,7 +271,9 @@ class VideoController:
             "--really-quiet",
             "--log-file=" + log_path,
             "--ao=alsa",
-            "--audio-device=alsa/dmix:CARD=vc4hdmi0,DEV=0",
+            "--audio-device=alsa/default:CARD=vc4hdmi0",
+            "--audio-samplerate=48000",
+            "--audio-channels=stereo",
         ]
         if fullscreen:
             base.append("--fullscreen")
@@ -921,16 +923,22 @@ class AudioController:
             
         device_for_audio = None
         if video_device:
-            device_for_audio = (
-                video_device.replace("alsa/hdmi:", "alsa/dmix:")
-                if "alsa/hdmi:" in video_device else video_device
-            )
+            # normalize to default:<CARD> for robust mixing/conversion
+            if "CARD=vc4hdmi0" in video_device:
+                device_for_audio = "alsa/default:CARD=vc4hdmi0"
+            elif "CARD=vc4hdmi1" in video_device:
+                device_for_audio = "alsa/default:CARD=vc4hdmi1"
+            else:
+                device_for_audio = video_device  # fallback
 
         cmd = [
             "mpv", "--no-video",
             "--input-ipc-server=" + self.sock_path,
             "--idle=yes", "--keep-open=yes",
-            "--ao=alsa", f"--log-file={self.log_path}",
+            "--ao=alsa",
+            "--audio-samplerate=48000",
+            "--audio-channels=stereo",
+            f"--log-file={self.log_path}",
             "--really-quiet",
         ]
         if device_for_audio:
