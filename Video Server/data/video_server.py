@@ -901,15 +901,15 @@ class AudioController:
         return self.proc is not None and self.proc.poll() is None
 
     def ensure_running(self):
-    """Start the audio-only mpv in idle mode if it's not running yet."""
-    if self._is_running():
-        return
-    # remove stale socket if present
-    try:
-        if os.path.exists(self.sock_path):
-            os.remove(self.sock_path)
-    except Exception:
-        pass
+        """Start the audio-only mpv in idle mode if it's not running yet."""
+        if self._is_running():
+            return
+        # remove stale socket if present
+        try:
+            if os.path.exists(self.sock_path):
+                os.remove(self.sock_path)
+        except Exception:
+            pass
 
     # adopt the video device up-front if available
     video_device = None
