@@ -271,7 +271,7 @@ class VideoController:
             "--really-quiet",
             "--log-file=" + log_path,
             "--ao=alsa",
-            "--audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0",
+            "--audio-device=alsa/dmix:CARD=vc4hdmi0,DEV=0",
         ]
         if fullscreen:
             base.append("--fullscreen")
@@ -918,18 +918,23 @@ class AudioController:
                 video_device = _controller.mpv.get_property("audio-device")
         except Exception:
             video_device = None
+            
+        device_for_audio = None
+        if video_device:
+            device_for_audio = (
+                video_device.replace("alsa/hdmi:", "alsa/dmix:")
+                if "alsa/hdmi:" in video_device else video_device
+            )
+
         cmd = [
-            "mpv",
-            "--no-video",
+            "mpv", "--no-video",
             "--input-ipc-server=" + self.sock_path,
-            "--idle=yes",
-            "--keep-open=yes",
-            "--ao=alsa",
-            f"--log-file={self.log_path}",
+            "--idle=yes", "--keep-open=yes",
+            "--ao=alsa", f"--log-file={self.log_path}",
             "--really-quiet",
         ]
-        if video_device:
-            cmd.append(f"--audio-device={video_device}")
+        if device_for_audio:
+            cmd.append(f"--audio-device={device_for_audio}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not self._wait_for_socket(3.0):
             raise RuntimeError("audio mpv failed to start")
@@ -1003,7 +1008,11 @@ class AudioController:
             if _controller and _controller.mpv:
                 video_device = _controller.mpv.get_property("audio-device")
                 if video_device:
-                    self._ipc(["set_property", "audio-device", video_device])
+                    device_for_audio = (
+                        video_device.replace("alsa/hdmi:", "alsa/dmix:")
+                        if "alsa/hdmi:" in video_device else video_device
+                    )
+                    self._ipc(["set_property", "audio-device", device_for_audio])
         except Exception as e:
             print(f"[audio] failed to adopt video device at runtime: {e}")
 
