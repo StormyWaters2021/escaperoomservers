@@ -296,20 +296,35 @@ class VideoController:
         base = [
             "mpv",
             f"--input-ipc-server={self.socket_path}",
-            "--idle=yes",                 # stay up with a blank window
-            "--force-window=yes",         # show black/blank until you /cogs/play
+            "--idle=yes",
+            "--force-window=yes",
             "--keep-open=no",
             "--cache=no",
+            "--msg-level=all=v",
+            "--reset-on-next-file=all",
             "--osc=no",
             "--no-terminal",
             "--loop-file=no",
             "--loop-playlist=no",
-            "--hwdec=auto",
+            "--hwdec=drm",
             "--vo=gpu",
+            "--video-rotate=0",
+            "--gpu-context=drm",
+            "--interpolation=no",
             "--video-sync=audio",
+            "--scale=bilinear",
+            "--dscale=bilinear",
+            "--tscale=linear",
+            "--msg-level=ipc=v", 
+            "--osd-level=0",
+            "--osd-status-msg=",
             "--really-quiet",
-            f"--log-file={log_path}",
-            "--ao=pulse",                 # IMPORTANT: Pulse for mixing with overlay
+            "--log-file=" + log_path,
+            "--ao=alsa",
+            # "--audio-device=alsa/plughw:CARD=wm8960soundcard,DEV=0",
+            "--audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0", # One HDMI port
+            # "--audio-device=alsa/hdmi:CARD=vc4hdmi1,DEV=0", # Other HDMI port
+            
         ]
         if fullscreen:
             base.append("--fullscreen")
@@ -1008,94 +1023,124 @@ _controller_lock = threading.Lock()
 # =========================
 # Audio-only MPV Controller
 # =========================
-# ----------------------------
-# Audio Controller (stateless, one-shot)
-# ----------------------------
 class AudioController:
-    """Launches a fresh 'mpv --no-video' per clip; exits automatically.
-       No IPC, no idle player, no 'replace', cannot touch the video player."""
-    def __init__(self):
+    def __init__(self, sock_path: str = "/tmp/mpv-audio.sock"):
+        self.sock_path = sock_path
         self.proc: Optional[subprocess.Popen] = None
-        self.log_path = "/tmp/mpv-audio.log"
-        # Optional: pin overlays to a specific Pulse sink (can also be set via an endpoint you already have)
-        self.pulse_sink: Optional[str] = os.environ.get("VIDEO_SERVER_PULSE_SINK")
 
+    # ---- process helpers ----
     def _is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def _reap(self):
-        if not self.proc:
-            return
-        try:
-            self.proc.wait(timeout=300)
-        except Exception:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
-        finally:
-            self.proc = None
+    def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            if os.path.exists(self.sock_path):
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.2)
+                        s.connect(self.sock_path)
+                        return True
+                except Exception:
+                    pass
+            time.sleep(0.03)
+        return False
 
+    def _ipc(self, cmd: list) -> Dict[str, Any]:
+        """Send a JSON-IPC command and return mpv's response (or {})."""
+        payload = (json.dumps({"command": cmd}) + "\n").encode("utf-8")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(self.sock_path)
+            s.sendall(payload)
+            data = b""
+            # read one line
+            while not data.endswith(b"\n"):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            return {}
+
+    # ---- public controls ----
     def start(self, path: str, volume: Optional[int] = None, loop: bool = False):
         abs_path = os.path.abspath(path)
         if not os.path.isfile(abs_path):
             raise RuntimeError(f"Audio file not found: {abs_path}")
-        if not os.access(abs_path, os.R_OK):
-            raise RuntimeError(f"Audio file not readable: {abs_path}")
-
-        # If a previous overlay is still running, stop it (or refuse if you prefer)
-        if self._is_running():
-            self.stop()
-
-        cmd = [
-            "mpv", "--no-video",
-            "--idle=no",              # exit when file finishes
-            "--keep-open=no",
-            "--title=AUDIO_MPV",
-            "--loop-file=no",
-            "--loop-playlist=no",
-            "--ao=pulse",
-            "--no-config",
-            "--no-input-default-bindings",
-            "--cache=no",
-            f"--log-file={self.log_path}",
-            "--really-quiet",
-        ]
-        if self.pulse_sink:
-            cmd.append(f"--pulse-sink={self.pulse_sink}")
+        # spin up mpv --no-video if not running
+        if not self._is_running():
+            # remove stale socket if present
+            try:
+                if os.path.exists(self.sock_path):
+                    os.remove(self.sock_path)
+            except Exception:
+                pass
+            self.proc = subprocess.Popen([
+                "mpv",
+                "--no-video",
+                "--input-ipc-server=" + self.sock_path,
+                "--idle=yes",           # stay alive between tracks
+                "--keep-open=yes",
+                "--really-quiet"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not self._wait_for_socket(3.0):
+                raise RuntimeError("audio mpv failed to start")
+        # load the file
+        self._ipc(["loadfile", abs_path, "replace"])
+        # loop setting
+        self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
+        # volume
         if volume is not None:
             v = max(0, min(100, int(volume)))
-            cmd.append(f"--volume={v}")
-        if loop:
-            cmd.append("--loop-file=inf")
-
-        cmd.append(abs_path)
-
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        threading.Thread(target=self._reap, daemon=True).start()
+            self._ipc(["set_property", "volume", v])
+        # ensure playing
+        self._ipc(["set_property", "pause", False])
 
     def stop(self):
         if not self._is_running():
             return
         try:
-            self.proc.terminate()
+            self._ipc(["quit"])
         except Exception:
             pass
         try:
-            self.proc.wait(timeout=2)
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
         except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+            pass
         self.proc = None
+        try:
+            if os.path.exists(self.sock_path):
+                os.remove(self.sock_path)
+        except Exception:
+            pass
 
-    # Keep your existing status/volume/sink endpoints wired to these helpers if you have them:
+    def set_volume(self, volume: int):
+        if not self._is_running():
+            raise RuntimeError("audio not running")
+        v = max(0, min(100, int(volume)))
+        self._ipc(["set_property", "volume", v])
+
     def status(self) -> Dict[str, Any]:
-        return {"running": self._is_running(), "sink": self.pulse_sink}
-
-    def set_sink(self, sink: str):
-        self.pulse_sink = sink
+        if not self._is_running():
+            return {"running": False}
+        # pull a few properties (best-effort)
+        resp = {
+            "running": True,
+            "volume": None,
+            "pause": None,
+            "filename": None,
+        }
+        try:
+            resp["volume"] = self._ipc(["get_property", "volume"]).get("data")
+            resp["pause"] = self._ipc(["get_property", "pause"]).get("data")
+            resp["filename"] = self._ipc(["get_property", "filename"]).get("data")
+        except Exception:
+            pass
+        return resp
 
 # single instance
 _audio = AudioController()
