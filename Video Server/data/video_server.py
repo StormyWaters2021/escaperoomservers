@@ -270,8 +270,7 @@ class VideoController:
             "--osd-status-msg=",
             "--really-quiet",
             "--log-file=" + log_path,
-            "--ao=alsa",
-            "--audio-device=alsa/default:CARD=vc4hdmi0",
+            "--ao=pulse",
             "--audio-samplerate=48000",
             "--audio-channels=stereo",
         ]
@@ -907,45 +906,24 @@ class AudioController:
         """Start the audio-only mpv in idle mode if it's not running yet."""
         if self._is_running():
             return
-        # remove stale socket if present
         try:
             if os.path.exists(self.sock_path):
                 os.remove(self.sock_path)
         except Exception:
             pass
-        # adopt current video-device if available
-        video_device = None
-        try:
-            if _controller and _controller.mpv:
-                video_device = _controller.mpv.get_property("audio-device")
-        except Exception:
-            video_device = None
-            
-        device_for_audio = None
-        if video_device:
-            # normalize to default:<CARD> for robust mixing/conversion
-            if "CARD=vc4hdmi0" in video_device:
-                device_for_audio = "alsa/default:CARD=vc4hdmi0"
-            elif "CARD=vc4hdmi1" in video_device:
-                device_for_audio = "alsa/default:CARD=vc4hdmi1"
-            else:
-                device_for_audio = video_device  # fallback
 
         cmd = [
             "mpv", "--no-video",
             "--input-ipc-server=" + self.sock_path,
             "--idle=yes", "--keep-open=yes",
-            "--ao=alsa",
-            "--audio-samplerate=48000",
-            "--audio-channels=stereo",
+            "--ao=pulse",
             f"--log-file={self.log_path}",
             "--really-quiet",
         ]
-        if device_for_audio:
-            cmd.append(f"--audio-device={device_for_audio}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not self._wait_for_socket(3.0):
             raise RuntimeError("audio mpv failed to start")
+
 
 
     def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
@@ -1011,18 +989,6 @@ class AudioController:
         # ensure mpv exists (idle) and adopts the video device
         self.ensure_running()
 
-        # Also set device via property (covers rare cases where the launch arg didn’t stick)
-        try:
-            if _controller and _controller.mpv:
-                video_device = _controller.mpv.get_property("audio-device")
-                if video_device:
-                    device_for_audio = (
-                        video_device.replace("alsa/hdmi:", "alsa/dmix:")
-                        if "alsa/hdmi:" in video_device else video_device
-                    )
-                    self._ipc(["set_property", "audio-device", device_for_audio])
-        except Exception as e:
-            print(f"[audio] failed to adopt video device at runtime: {e}")
 
         # Clear any inherited pause state, then load and play
         self._ipc(["set_property", "mute", False])
