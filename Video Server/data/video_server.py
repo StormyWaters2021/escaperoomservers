@@ -957,6 +957,7 @@ class AudioController:
             if not self._wait_for_socket(3.0):
                 raise RuntimeError("audio mpv failed to start")
         # load the file
+        self._ipc(["set_property", "pause", False])
         self._ipc(["loadfile", abs_path, "replace"])
         # loop setting
         self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
@@ -965,6 +966,8 @@ class AudioController:
             v = max(0, min(100, int(volume)))
             self._ipc(["set_property", "volume", v])
         # ensure playing
+        self._ipc(["set_property", "pause", False])
+        time.sleep(0.02)
         self._ipc(["set_property", "pause", False])
 
     def stop(self):
