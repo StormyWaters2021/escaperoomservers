@@ -900,6 +900,42 @@ class AudioController:
     def _is_running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def ensure_running(self):
+    """Start the audio-only mpv in idle mode if it's not running yet."""
+    if self._is_running():
+        return
+    # remove stale socket if present
+    try:
+        if os.path.exists(self.sock_path):
+            os.remove(self.sock_path)
+    except Exception:
+        pass
+
+    # adopt the video device up-front if available
+    video_device = None
+    try:
+        if _controller and _controller.mpv:
+            video_device = _controller.mpv.get_property("audio-device")
+    except Exception:
+        video_device = None
+
+    cmd = [
+        "mpv",
+        "--no-video",
+        "--input-ipc-server=" + self.sock_path,
+        "--idle=yes",
+        "--keep-open=yes",
+        "--ao=alsa",
+        "--really-quiet",
+    ]
+    if video_device:
+        cmd.append(f"--audio-device={video_device}")
+
+    self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not self._wait_for_socket(3.0):
+        raise RuntimeError("audio mpv failed to start")
+
+
     def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout_s:
@@ -1028,7 +1064,7 @@ class AudioController:
 
     def set_device(self, name: str):
         if not self._is_running():
-            raise RuntimeError("audio not running")
+            self.ensure_running()
         self._ipc(["set_property", "audio-device", name])
 
     def get_devices(self) -> list:
@@ -1544,6 +1580,16 @@ def cogs_audio_device_sync():
         return {"ok": True, "device": vid_dev}
     except Exception:
         raise HTTPException(500, "failed to sync device")
+
+
+@app.get("/cogs/audio/start")
+def cogs_audio_start():
+    try:
+        _audio.ensure_running()
+        return {"ok": True}
+    except Exception:
+        raise HTTPException(500, "failed to start audio")
+
 
 # ======== Entrypoint ========
 
