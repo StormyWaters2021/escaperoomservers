@@ -922,7 +922,6 @@ class AudioController:
             s.connect(self.sock_path)
             s.sendall(payload)
             data = b""
-            # read one line
             while not data.endswith(b"\n"):
                 chunk = s.recv(4096)
                 if not chunk:
@@ -938,7 +937,8 @@ class AudioController:
         abs_path = os.path.abspath(path)
         if not os.path.isfile(abs_path):
             raise RuntimeError(f"Audio file not found: {abs_path}")
-        # spin up mpv --no-video if not running
+
+        # Launch audio-only mpv if needed, adopting the *video* device up front
         if not self._is_running():
             # remove stale socket if present
             try:
@@ -946,51 +946,57 @@ class AudioController:
                     os.remove(self.sock_path)
             except Exception:
                 pass
-            self.proc = subprocess.Popen([
+
+            # Try to read the current audio-device from the video controller
+            video_device = None
+            try:
+                if _controller and _controller.mpv:
+                    video_device = _controller.mpv.get_property("audio-device")
+            except Exception:
+                video_device = None
+
+            cmd = [
                 "mpv",
                 "--no-video",
                 "--input-ipc-server=" + self.sock_path,
-                "--idle=yes",           # stay alive between tracks
-                "--keep-open=yes",
-                "--really-quiet"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                "--idle=yes",      # stay alive between tracks
+                "--keep-open=yes", # do not exit between files
+            ]
+            if video_device:
+                cmd.append(f"--audio-device={video_device}")
+            cmd.append("--really-quiet")
+
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             if not self._wait_for_socket(3.0):
                 raise RuntimeError("audio mpv failed to start")
 
-        # adopt same audio-device as the video controller if available
+        # Also set device via property (covers rare cases where the launch arg didn’t stick)
         try:
             if _controller and _controller.mpv:
                 video_device = _controller.mpv.get_property("audio-device")
                 if video_device:
                     self._ipc(["set_property", "audio-device", video_device])
         except Exception as e:
-            print(f"[audio] failed to adopt video device: {e}")
+            print(f"[audio] failed to adopt video device at runtime: {e}")
 
-        # load the file
+        # Clear any inherited pause state, then load and play
         self._ipc(["set_property", "pause", False])
         self._ipc(["loadfile", abs_path, "replace"])
+
         # loop setting
         self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
+
         # volume
         if volume is not None:
             v = max(0, min(100, int(volume)))
             self._ipc(["set_property", "volume", v])
-        # ensure playing
+
+        # ensure playing (twice to beat timing races on some builds)
         self._ipc(["set_property", "pause", False])
         time.sleep(0.02)
         self._ipc(["set_property", "pause", False])
-        
-    def set_device(self, name: str):
-        if not self._is_running():
-            raise RuntimeError("audio not running")
-        self._ipc(["set_property", "audio-device", name])
-
-   def get_devices(self) -> list:
-        if not self._is_running():
-            # spin up a temporary connection to query devices by starting (idle) if needed
-            self.start(path=os.devnull, loop=False)  # harmless; will be replaced on first real play
-        resp = self._ipc(["get_property", "audio-device-list"])
-        return resp.get("data", [])        
 
     def stop(self):
         if not self._is_running():
@@ -1017,16 +1023,43 @@ class AudioController:
         v = max(0, min(100, int(volume)))
         self._ipc(["set_property", "volume", v])
 
+    def set_device(self, name: str):
+        if not self._is_running():
+            raise RuntimeError("audio not running")
+        self._ipc(["set_property", "audio-device", name])
+
+    def get_devices(self) -> list:
+        # ensure mpv is up so the device list exists
+        if not self._is_running():
+            # start idle with adopted device (no file loaded)
+            try:
+                video_device = None
+                if _controller and _controller.mpv:
+                    video_device = _controller.mpv.get_property("audio-device")
+                cmd = [
+                    "mpv",
+                    "--no-video",
+                    "--input-ipc-server=" + self.sock_path,
+                    "--idle=yes",
+                    "--keep-open=yes",
+                ]
+                if video_device:
+                    cmd.append(f"--audio-device={video_device}")
+                cmd.append("--really-quiet")
+                self.proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                if not self._wait_for_socket(3.0):
+                    return []
+            except Exception:
+                return []
+        resp = self._ipc(["get_property", "audio-device-list"])
+        return resp.get("data", [])
+
     def status(self) -> Dict[str, Any]:
         if not self._is_running():
             return {"running": False}
-        # pull a few properties (best-effort)
-        resp = {
-            "running": True,
-            "volume": None,
-            "pause": None,
-            "filename": None,
-        }
+        resp: Dict[str, Any] = {"running": True, "volume": None, "pause": None, "filename": None}
         try:
             resp["volume"] = self._ipc(["get_property", "volume"]).get("data")
             resp["pause"] = self._ipc(["get_property", "pause"]).get("data")
@@ -1034,6 +1067,7 @@ class AudioController:
         except Exception:
             pass
         return resp
+
 
 # single instance
 _audio = AudioController()
