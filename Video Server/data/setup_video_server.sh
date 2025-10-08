@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-[ -n "${BASH_VERSION:-}" ] || exec /usr/bin/env bash "$0" "$@"
 set -euo pipefail
 
 ### ------------ Config (no git pulls here) ------------
@@ -11,10 +10,7 @@ PORT="${PORT:-8000}"
 # Use the repo that was cloned by the master installer
 REPO_ROOT="${ESCAPEROOM_REPO_DIR:-/opt/escaperoomservers/repo}"
 
-# Add PulseAudio + ALSA utilities; keep mpv/ffmpeg/libmpv etc.
-APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2 \
-          pulseaudio alsa-utils)
-
++APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
 PIP_PKGS=(fastapi "uvicorn[standard]" python-mpv pydantic requests)
 
 # Choose the service user
@@ -25,12 +21,10 @@ elif id -u pi &>/dev/null; then
 else
   RUN_USER="$(id -un)"
 fi
-RUN_UID="$(id -u "$RUN_USER")"
-XDG_RUNTIME_DIR="/run/user/${RUN_UID}"
-PULSE_SERVER="unix:${XDG_RUNTIME_DIR}/pulse/native"
 ### ----------------------------------------------------
 
 msg(){ echo "==> $*"; }
+
 require_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }; }
 
 install_apt() {
@@ -41,24 +35,10 @@ install_apt() {
 }
 
 prepare_user_env() {
-  msg "Ensuring ${RUN_USER} has video access & basic dirs..."
+  msg "Ensuring ${RUN_USER} has video access..."
   usermod -aG video,render "$RUN_USER" || true
   mkdir -p "/home/${RUN_USER}/Videos"
   chown -R "${RUN_USER}:${RUN_USER}" "/home/${RUN_USER}/Videos"
-
-  # Make sure a runtime dir exists at boot for the user (systemd does this, but ensure linger)
-  msg "Enabling user lingering for ${RUN_USER} so PulseAudio is available at boot..."
-  loginctl enable-linger "${RUN_USER}" || true
-
-  # Start/enable the user's PulseAudio daemon now (so sockets exist)
-  msg "Starting PulseAudio for ${RUN_USER}..."
-  # Create runtime dir if missing (e.g., running from non-login context)
-  mkdir -p "${XDG_RUNTIME_DIR}"
-  chown -R "${RUN_USER}:${RUN_USER}" "${XDG_RUNTIME_DIR}"
-  chmod 700 "${XDG_RUNTIME_DIR}"
-
-  # Enable + start user pulseaudio
-  sudo -u "${RUN_USER}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" systemctl --user enable --now pulseaudio || true
 }
 
 find_src_dir() {
@@ -81,7 +61,7 @@ deploy_files() {
   # normalize endings
   sed -i 's/\r$//' "${APP_DIR}/video_server.py" || true
 
-  # ensure data dir exists for any future assets
+  # ensure data dir exists for assets like blank.mp4
   mkdir -p "${APP_DIR}/data"
   chown -R "${RUN_USER}:${RUN_USER}" "${APP_DIR}/data"
 
@@ -96,6 +76,21 @@ deploy_files() {
     fc-cache -f || true
   fi
 }
+
+make_blank_video() {
+  # Create a tiny 10s black 1920x1080 H.264 MP4 used as the idle/blank screen.
+  # Safe to run repeatedly; only writes if missing.
+  local BLANK="${APP_DIR}/data/blank.mp4"
+  if [[ ! -f "$BLANK" ]]; then
+    msg "Creating blank video at ${BLANK} ..."
+    # 10 seconds, silent, constant black. Hardware-friendly (h264 baseline).
+    sudo -u "${RUN_USER}" ffmpeg -y -v error -f lavfi -i color=c=black:s=1920x1080:r=30:d=10 \
+      -f lavfi -i anullsrc=r=48000:cl=stereo -shortest \
+      -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.0 -crf 28 -preset veryfast \
+      -c:a aac -b:a 96k "$BLANK"
+  fi
+}
+
 
 create_venv() {
   msg "Creating Python venv + pip deps..."
@@ -115,14 +110,14 @@ write_runner() {
   cat >/usr/local/bin/${APP_NAME}-run.sh <<RUN
 #!/usr/bin/env bash
 set -euo pipefail
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}"
-export PULSE_SERVER="${PULSE_SERVER}"
 cd "${APP_DIR}"
 # Allow a simple skip flag at runtime if you ever need it:
 [[ -f /run/video-server-skip ]] && { echo "[video-server] Skip flag present. Not starting."; exit 77; }
+# Boot with a blank video so mpv opens the display immediately and waits for commands
+BLANK="\${BLANK:-${APP_DIR}/data/blank.mp4}"
 exec "${APP_DIR}/.venv/bin/python" "${APP_DIR}/video_server.py" \\
   --host 0.0.0.0 --port ${PORT} \\
-  --fullscreen
+  --main "\${BLANK}" --fullscreen
 RUN
   chmod +x /usr/local/bin/${APP_NAME}-run.sh
   sed -i 's/\r$//' /usr/local/bin/${APP_NAME}-run.sh || true
@@ -135,18 +130,14 @@ write_unit() {
 [Unit]
 Description=Video Server (mpv + FastAPI)
 Wants=network-online.target
-After=network-online.target sound.target
+After=network-online.target
 ConditionPathExists=!${BOOT_DIR}/video-server.disable
 ConditionPathExists=!/boot/video-server.disable
 
 [Service]
 Type=simple
 User=${RUN_USER}
-Group=${RUN_USER}
 WorkingDirectory=${APP_DIR}
-# Ensure the service can reach the user's PulseAudio socket
-Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
-Environment=PULSE_SERVER=${PULSE_SERVER}
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/local/bin/${APP_NAME}-run.sh
 StandardOutput=journal
@@ -181,13 +172,6 @@ reload_enable_start() {
 post_checks() {
   echo
   echo "==> Post-install checks:"
-  # Pulse check (socket exists)
-  if [[ -S "${PULSE_SERVER#unix:}" ]]; then
-    echo "OK: Pulse socket present at ${PULSE_SERVER#unix:}"
-  else
-    echo "WARN: Pulse socket not found (${PULSE_SERVER#unix:}). If audio is silent, ensure pulseaudio is running for ${RUN_USER}."
-  fi
-
   if systemctl is-active --quiet "${SERVICE}"; then
     for i in {1..12}; do
       if curl -fsS -m 2 "http://127.0.0.1:${PORT}/status" >/dev/null; then
@@ -199,7 +183,6 @@ post_checks() {
   else
     echo "Service not active; run: sudo journalctl -u ${SERVICE} -e -f"
   fi
-
   local IP_NOW; IP_NOW="$(hostname -I 2>/dev/null | awk '{print $1}')"
   echo
   echo "Service: ${SERVICE}"
