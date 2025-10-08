@@ -1044,7 +1044,7 @@ class AudioController:
                 except Exception:
                     pass
             time.sleep(0.03)
-       return False
+        return False
 
     def _ipc(self, cmd: list) -> Dict[str, Any]:
         """Send a JSON-IPC command and return mpv's response (or {})."""
