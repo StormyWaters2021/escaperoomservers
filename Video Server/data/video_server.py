@@ -264,7 +264,7 @@ class VideoController:
             "--loop-playlist=no",
             "--hwdec=drm",
             "--vo=gpu",
-            "--video-rotate=90",
+            "--video-rotate=0",
             "--gpu-context=drm",
             "--interpolation=no",
             "--video-sync=audio",
@@ -1320,3 +1320,4 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
