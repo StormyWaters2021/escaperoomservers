@@ -953,19 +953,23 @@ class AudioController:
         """Send a JSON-IPC command and return mpv's response (or {})."""
         payload = (json.dumps({"command": cmd}) + "\n").encode("utf-8")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
+            s.settimeout(2.5)             # allow a bit more time
             s.connect(self.sock_path)
             s.sendall(payload)
             data = b""
-            while not data.endswith(b"\n"):
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
+            # read until newline OR timeout
+            try:
+                while not data.endswith(b"\n"):
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
         try:
             return json.loads(data.decode("utf-8"))
         except Exception:
-            return {}
+            return {}                     # tolerate commands that produce no reply
 
     def _get(self, prop: str):
         try:
@@ -1008,7 +1012,9 @@ class AudioController:
         self._ipc(["set_property", "pause", False])
         # load file and validate mpv accepted it
         resp = self._ipc(["loadfile", abs_path, "replace"])
-        if resp.get("error") != "success":
+        # Some mpv builds send no immediate reply for 'loadfile'. If we didn't get an explicit
+        # error, proceed and verify playback via idle/filename below.
+        if resp.get("error") not in (None, "success"):
             raise RuntimeError(f"mpv loadfile failed: {resp}")
 
         # loop setting
