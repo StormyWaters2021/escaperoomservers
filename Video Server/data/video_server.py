@@ -910,30 +910,27 @@ class AudioController:
                 os.remove(self.sock_path)
         except Exception:
             pass
-
-    # adopt the video device up-front if available
-    video_device = None
-    try:
-        if _controller and _controller.mpv:
-            video_device = _controller.mpv.get_property("audio-device")
-    except Exception:
+        # adopt current video-device if available
         video_device = None
-
-    cmd = [
-        "mpv",
-        "--no-video",
-        "--input-ipc-server=" + self.sock_path,
-        "--idle=yes",
-        "--keep-open=yes",
-        "--ao=alsa",
-        "--really-quiet",
-    ]
-    if video_device:
-        cmd.append(f"--audio-device={video_device}")
-
-    self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not self._wait_for_socket(3.0):
-        raise RuntimeError("audio mpv failed to start")
+        try:
+            if _controller and _controller.mpv:
+                video_device = _controller.mpv.get_property("audio-device")
+        except Exception:
+            video_device = None
+        cmd = [
+            "mpv",
+            "--no-video",
+            "--input-ipc-server=" + self.sock_path,
+            "--idle=yes",
+            "--keep-open=yes",
+            "--ao=alsa",
+            "--really-quiet",
+        ]
+        if video_device:
+            cmd.append(f"--audio-device={video_device}")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not self._wait_for_socket(3.0):
+            raise RuntimeError("audio mpv failed to start")
 
 
     def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
@@ -974,40 +971,8 @@ class AudioController:
         if not os.path.isfile(abs_path):
             raise RuntimeError(f"Audio file not found: {abs_path}")
 
-        # Launch audio-only mpv if needed, adopting the *video* device up front
-        if not self._is_running():
-            # remove stale socket if present
-            try:
-                if os.path.exists(self.sock_path):
-                    os.remove(self.sock_path)
-            except Exception:
-                pass
-
-            # Try to read the current audio-device from the video controller
-            video_device = None
-            try:
-                if _controller and _controller.mpv:
-                    video_device = _controller.mpv.get_property("audio-device")
-            except Exception:
-                video_device = None
-
-            cmd = [
-                "mpv",
-                "--no-video",
-                "--input-ipc-server=" + self.sock_path,
-                "--idle=yes",      # stay alive between tracks
-                "--keep-open=yes", # do not exit between files
-                "--ao=alsa",
-            ]
-            if video_device:
-                cmd.append(f"--audio-device={video_device}")
-            cmd.append("--really-quiet")
-
-            self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            if not self._wait_for_socket(3.0):
-                raise RuntimeError("audio mpv failed to start")
+        # ensure mpv exists (idle) and adopts the video device
+        self.ensure_running()
 
         # Also set device via property (covers rare cases where the launch arg didn’t stick)
         try:
@@ -1058,7 +1023,7 @@ class AudioController:
 
     def set_volume(self, volume: int):
         if not self._is_running():
-            raise RuntimeError("audio not running")
+            self.ensure_running()
         v = max(0, min(100, int(volume)))
         self._ipc(["set_property", "volume", v])
 
@@ -1068,31 +1033,8 @@ class AudioController:
         self._ipc(["set_property", "audio-device", name])
 
     def get_devices(self) -> list:
-        # ensure mpv is up so the device list exists
         if not self._is_running():
-            # start idle with adopted device (no file loaded)
-            try:
-                video_device = None
-                if _controller and _controller.mpv:
-                    video_device = _controller.mpv.get_property("audio-device")
-                cmd = [
-                    "mpv",
-                    "--no-video",
-                    "--input-ipc-server=" + self.sock_path,
-                    "--idle=yes",
-                    "--keep-open=yes",
-                    "--ao=alsa",
-                ]
-                if video_device:
-                    cmd.append(f"--audio-device={video_device}")
-                cmd.append("--really-quiet")
-                self.proc = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                if not self._wait_for_socket(3.0):
-                    return []
-            except Exception:
-                return []
+            self.ensure_running()
         resp = self._ipc(["get_property", "audio-device-list"])
         return resp.get("data", [])
 
@@ -1580,6 +1522,7 @@ def cogs_audio_device_sync():
         return {"ok": True, "device": vid_dev}
     except Exception:
         raise HTTPException(500, "failed to sync device")
+
 
 
 @app.get("/cogs/audio/start")
