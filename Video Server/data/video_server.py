@@ -604,6 +604,15 @@ class VideoController:
     def _play_file(self, path: str, loop: bool, start: Optional[float] = None):
         abs_path = os.path.abspath(path)
 
+        # Do not allow audio-only files to replace the VIDEO instance.
+        # This prevents accidental /cogs/play of a .wav/.mp3/.ogg/etc.
+        audio_exts = {".wav", ".mp3", ".ogg", ".flac", ".aac", ".m4a", ".opus"}
+        try:
+           if os.path.splitext(abs_path.lower())[1] in audio_exts:
+                raise RuntimeError(f"Refusing to load audio-only file on VIDEO player: {abs_path}")
+        except Exception:
+            pass
+
         # Allow http(s), otherwise require local file
         if not (abs_path.startswith("http://") or abs_path.startswith("https://")):
             if not os.path.exists(abs_path):
@@ -925,6 +934,7 @@ class AudioController:
             "--title=AUDIO_MPV",
             "--reset-on-next-file=all",
             "--loop-file=no",
+            "--loop-playlist=no",
             "--ao=pulse",
             f"--log-file={self.log_path}",
             "--really-quiet",
@@ -1011,16 +1021,21 @@ class AudioController:
         except Exception:
             pass
         
-        # ensure loop is off by default, then load
+        # ensure NO loop by default, then load
         self._ipc(["set_property", "loop-file", "no"])
+        self._ipc(["set_property", "loop-playlist", "no"])
         resp = self._ipc(["loadfile", abs_path, "replace"])
         # Some mpv builds send no immediate reply for 'loadfile'. If we didn't get an explicit
         # error, proceed and verify playback via idle/filename below.
         if resp.get("error") not in (None, "success"):
             raise RuntimeError(f"mpv loadfile failed: {resp}")
 
-        # loop setting (default: no loop)
-        self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
+        # loop setting (default: NO loop)
+        if loop:
+            self._ipc(["set_property", "loop-file", "inf"])
+        else:
+            self._ipc(["set_property", "loop-file", "no"])
+            self._ipc(["set_property", "loop-playlist", "no"])
 
         # volume
         if volume is not None:
