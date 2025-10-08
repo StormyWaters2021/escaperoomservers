@@ -9,6 +9,7 @@ except Exception:
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi import Request
+import socket, subprocess, os, time, json, threading
 
 def _first(v):
     # flatten values that may come from parse_qs
@@ -1019,6 +1020,131 @@ app = FastAPI()
 _controller: Optional[VideoController] = None
 _controller_lock = threading.Lock()
 
+# =========================
+# Audio-only MPV Controller
+# =========================
+class AudioController:
+    def __init__(self, sock_path: str = "/tmp/mpv-audio.sock"):
+        self.sock_path = sock_path
+        self.proc: Optional[subprocess.Popen] = None
+
+    # ---- process helpers ----
+    def _is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _wait_for_socket(self, timeout_s: float = 3.0) -> bool:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            if os.path.exists(self.sock_path):
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.2)
+                        s.connect(self.sock_path)
+                        return True
+                except Exception:
+                    pass
+            time.sleep(0.03)
+       return False
+
+    def _ipc(self, cmd: list) -> Dict[str, Any]:
+        """Send a JSON-IPC command and return mpv's response (or {})."""
+        payload = (json.dumps({"command": cmd}) + "\n").encode("utf-8")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(self.sock_path)
+            s.sendall(payload)
+            data = b""
+            # read one line
+            while not data.endswith(b"\n"):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            return {}
+
+    # ---- public controls ----
+    def start(self, path: str, volume: Optional[int] = None, loop: bool = False):
+        abs_path = os.path.abspath(path)
+        if not os.path.isfile(abs_path):
+            raise RuntimeError(f"Audio file not found: {abs_path}")
+        # spin up mpv --no-video if not running
+        if not self._is_running():
+            # remove stale socket if present
+            try:
+                if os.path.exists(self.sock_path):
+                    os.remove(self.sock_path)
+            except Exception:
+                pass
+            self.proc = subprocess.Popen([
+                "mpv",
+                "--no-video",
+                "--input-ipc-server=" + self.sock_path,
+                "--idle=yes",           # stay alive between tracks
+                "--keep-open=yes",
+                "--really-quiet"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not self._wait_for_socket(3.0):
+                raise RuntimeError("audio mpv failed to start")
+        # load the file
+        self._ipc(["loadfile", abs_path, "replace"])
+        # loop setting
+        self._ipc(["set_property", "loop-file", "inf" if loop else "no"])
+        # volume
+        if volume is not None:
+            v = max(0, min(100, int(volume)))
+            self._ipc(["set_property", "volume", v])
+        # ensure playing
+        self._ipc(["set_property", "pause", False])
+
+    def stop(self):
+        if not self._is_running():
+            return
+        try:
+            self._ipc(["quit"])
+        except Exception:
+            pass
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+        self.proc = None
+        try:
+            if os.path.exists(self.sock_path):
+                os.remove(self.sock_path)
+        except Exception:
+            pass
+
+    def set_volume(self, volume: int):
+        if not self._is_running():
+            raise RuntimeError("audio not running")
+        v = max(0, min(100, int(volume)))
+        self._ipc(["set_property", "volume", v])
+
+    def status(self) -> Dict[str, Any]:
+        if not self._is_running():
+            return {"running": False}
+        # pull a few properties (best-effort)
+        resp = {
+            "running": True,
+            "volume": None,
+            "pause": None,
+            "filename": None,
+        }
+        try:
+            resp["volume"] = self._ipc(["get_property", "volume"]).get("data")
+            resp["pause"] = self._ipc(["get_property", "pause"]).get("data")
+            resp["filename"] = self._ipc(["get_property", "filename"]).get("data")
+        except Exception:
+            pass
+        return resp
+
+# single instance
+_audio = AudioController()
+
 # --- Error helpers & debug utilities ---
 logging.basicConfig(level=logging.INFO)
 
@@ -1424,6 +1550,34 @@ def cogs_overlay_path(rotate_deg: int, align: str, margin_x: int, margin_y: int,
         )
     return {"ok": True}
 
+@app.get("/cogs/audio/play")
+def cogs_audio_play(path: str, volume: Optional[int] = None, loop: int = 0):
+    try:
+        _audio.start(path, volume=None if volume is None else int(volume), loop=bool(int(loop)))
+        return {"ok": True}
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "failed to start audio")
+
+@app.get("/cogs/audio/stop")
+def cogs_audio_stop():
+    _audio.stop()
+    return {"ok": True}
+
+@app.get("/cogs/audio/status")
+def cogs_audio_status():
+    return {"ok": True, **_audio.status()}
+
+@app.get("/cogs/audio/volume")
+def cogs_audio_volume(volume: int):
+    try:
+        _audio.set_volume(int(volume))
+        return {"ok": True, "volume": int(volume)}
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "failed to set volume")
 
 # ======== Entrypoint ========
 
@@ -1469,6 +1623,7 @@ if __name__ == "__main__":
     _controller = VideoController(main_path=args.main, fullscreen=args.fullscreen)
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
+
 
 
 
