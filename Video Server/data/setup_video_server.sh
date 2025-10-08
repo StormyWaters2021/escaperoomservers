@@ -10,7 +10,7 @@ PORT="${PORT:-8000}"
 # Use the repo that was cloned by the master installer
 REPO_ROOT="${ESCAPEROOM_REPO_DIR:-/opt/escaperoomservers/repo}"
 
-APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl ffmpeg libmpv2)
+APT_PKGS=(mpv python3 python3-venv python3-pip fontconfig fonts-dejavu-core curl)
 PIP_PKGS=(fastapi "uvicorn[standard]" python-mpv pydantic requests)
 
 # Choose the service user
@@ -61,10 +61,6 @@ deploy_files() {
   # normalize endings
   sed -i 's/\r$//' "${APP_DIR}/video_server.py" || true
 
-  # ensure data dir exists for assets like blank.mp4
-  mkdir -p "${APP_DIR}/data"
-  chown -R "${RUN_USER}:${RUN_USER}" "${APP_DIR}/data"
-
   # Copy optional fonts folder that sits alongside data/
   local SERVER_DIR; SERVER_DIR="$(dirname "$SRC_DIR")"
   if [[ -d "${SERVER_DIR}/fonts" ]]; then
@@ -76,21 +72,6 @@ deploy_files() {
     fc-cache -f || true
   fi
 }
-
-make_blank_video() {
-  # Create a tiny 10s black 1920x1080 H.264 MP4 used as the idle/blank screen.
-  # Safe to run repeatedly; only writes if missing.
-  local BLANK="${APP_DIR}/data/blank.mp4"
-  if [[ ! -f "$BLANK" ]]; then
-    msg "Creating blank video at ${BLANK} ..."
-    # 10 seconds, silent, constant black. Hardware-friendly (h264 baseline).
-    sudo -u "${RUN_USER}" ffmpeg -y -v error -f lavfi -i color=c=black:s=1920x1080:r=30:d=10 \
-      -f lavfi -i anullsrc=r=48000:cl=stereo -shortest \
-      -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.0 -crf 28 -preset veryfast \
-      -c:a aac -b:a 96k "$BLANK"
-  fi
-}
-
 
 create_venv() {
   msg "Creating Python venv + pip deps..."
@@ -113,11 +94,7 @@ set -euo pipefail
 cd "${APP_DIR}"
 # Allow a simple skip flag at runtime if you ever need it:
 [[ -f /run/video-server-skip ]] && { echo "[video-server] Skip flag present. Not starting."; exit 77; }
-# Boot with a blank video so mpv opens the display immediately and waits for commands
-BLANK="\${BLANK:-${APP_DIR}/data/blank.mp4}"
-exec "${APP_DIR}/.venv/bin/python" "${APP_DIR}/video_server.py" \\
-  --host 0.0.0.0 --port ${PORT} \\
-  --main "\${BLANK}" --fullscreen
+exec "${APP_DIR}/.venv/bin/python" "${APP_DIR}/video_server.py" --host 0.0.0.0 --port ${PORT}
 RUN
   chmod +x /usr/local/bin/${APP_NAME}-run.sh
   sed -i 's/\r$//' /usr/local/bin/${APP_NAME}-run.sh || true
@@ -210,4 +187,3 @@ case "${1:-install}" in
   install) cmd_install;;
   *) echo "Usage: $0 [install]"; exit 1;;
 esac
-
