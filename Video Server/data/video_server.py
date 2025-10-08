@@ -956,6 +956,16 @@ class AudioController:
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not self._wait_for_socket(3.0):
                 raise RuntimeError("audio mpv failed to start")
+
+        # adopt same audio-device as the video controller if available
+        try:
+            if _controller and _controller.mpv:
+                video_device = _controller.mpv.get_property("audio-device")
+                if video_device:
+                    self._ipc(["set_property", "audio-device", video_device])
+        except Exception as e:
+            print(f"[audio] failed to adopt video device: {e}")
+
         # load the file
         self._ipc(["set_property", "pause", False])
         self._ipc(["loadfile", abs_path, "replace"])
@@ -969,6 +979,18 @@ class AudioController:
         self._ipc(["set_property", "pause", False])
         time.sleep(0.02)
         self._ipc(["set_property", "pause", False])
+        
+    def set_device(self, name: str):
+        if not self._is_running():
+            raise RuntimeError("audio not running")
+        self._ipc(["set_property", "audio-device", name])
+
+   def get_devices(self) -> list:
+        if not self._is_running():
+            # spin up a temporary connection to query devices by starting (idle) if needed
+            self.start(path=os.devnull, loop=False)  # harmless; will be replaced on first real play
+        resp = self._ipc(["get_property", "audio-device-list"])
+        return resp.get("data", [])        
 
     def stop(self):
         if not self._is_running():
@@ -1449,6 +1471,41 @@ def cogs_audio_volume(volume: int):
         raise HTTPException(400, str(e))
     except Exception:
         raise HTTPException(500, "failed to set volume")
+
+
+@app.get("/cogs/audio/devices")
+def cogs_audio_devices():
+    try:
+        devices = _audio.get_devices()
+        return {"ok": True, "devices": devices}
+    except Exception:
+        raise HTTPException(500, "failed to get devices")
+
+@app.get("/cogs/audio/device")
+def cogs_audio_device(name: str):
+    try:
+        _audio.set_device(name)
+        return {"ok": True, "device": name}
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        raise HTTPException(500, "failed to set device")
+
+@app.get("/cogs/audio/device/sync")
+def cogs_audio_device_sync():
+    if not _controller:
+        raise HTTPException(500, "video controller not initialized")
+    try:
+        vid_dev = _controller.mpv.get_property("audio-device")
+    except Exception:
+        vid_dev = None
+    if not vid_dev:
+        raise HTTPException(400, "video audio-device not available")
+    try:
+        _audio.set_device(vid_dev)
+        return {"ok": True, "device": vid_dev}
+    except Exception:
+        raise HTTPException(500, "failed to sync device")
 
 # ======== Entrypoint ========
 
