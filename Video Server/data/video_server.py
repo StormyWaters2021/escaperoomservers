@@ -16,6 +16,32 @@ def _first(v):
         return v[0] if v else None
     return v
 
+def _to_ass_bgr_color(color: Optional[str], default_ass: str) -> str:
+    """Convert a user color to ASS BGR format (&HBBGGRR&).
+    Accepts:
+      - None -> default_ass
+      - '#RRGGBB' or 'RRGGBB'
+      - already in ASS form like '&HFFFFFF&'
+    """
+    if color is None:
+        return default_ass
+    s = str(color).strip()
+    if not s:
+        return default_ass
+    up = s.upper()
+    if up.startswith("&H") and up.endswith("&") and len(up) >= 4:
+        return up
+    if up.startswith("#"):
+        up = up[1:]
+    # allow 0xRRGGBB too
+    if up.startswith("0X"):
+        up = up[2:]
+    if len(up) != 6 or any(c not in "0123456789ABCDEF" for c in up):
+        raise ValueError(f"Invalid color '{color}'. Expected #RRGGBB, RRGGBB, or &HBBGGRR&.")
+    rr = up[0:2]; gg = up[2:4]; bb = up[4:6]
+    return f"&H{bb}{gg}{rr}&"
+
+
 async def _parse_noheader_body(request: Request) -> dict:
     """
     Accepts POST bodies without Content-Type.
@@ -375,7 +401,11 @@ class VideoController:
         font_name = getattr(self, "_osd_timer_font_name", "DejaVu Sans").replace("{","").replace("}","")
         font_tag = ("\\fn" + font_name) if font_name else ""
         size_tag = "\\fs" + str(int(getattr(self, "_osd_timer_font", 72)))
-        style_common = "\\bord4\\1c&HFFFFFF&\\3c&H000000&\\fad(0,0)"
+        tc = getattr(self, "_osd_timer_text_color_ass", "&HFFFFFF&")
+        oc = getattr(self, "_osd_timer_outline_color_ass", "&H000000&")
+        tc = getattr(self, "_osd_timer_text_color_ass", "&HFFFFFF&")
+        oc = getattr(self, "_osd_timer_outline_color_ass", "&H000000&")
+        style_common = f"\\bord4\\1c{tc}\\3c{oc}\\fad(0,0)"
 
         # placement on a fixed virtual canvas
         CANVAS_W, CANVAS_H = 1000, 1000
@@ -446,7 +476,8 @@ class VideoController:
     def start_osd_timer(self, seconds: int, rotation: int = 180, anchor: int = 9, font_size: int = 72,
                         font: Optional[str] = None, position_mode: str = "anchor",
                         x: Optional[float] = None, y: Optional[float] = None,
-                        margin_x: int = 40, margin_y: int = 40):
+                        margin_x: int = 40, margin_y: int = 40,
+                        text_color: Optional[str] = None, outline_color: Optional[str] = None):
         import threading, time
 
         self._ensure_osd_timer_state()
@@ -497,6 +528,13 @@ class VideoController:
         self._osd_timer_y = y
         self._osd_timer_margin_x = int(margin_x)
         self._osd_timer_margin_y = int(margin_y)
+
+        # optional timer colors (ASS uses BGR format)
+        try:
+            self._osd_timer_text_color_ass = _to_ass_bgr_color(text_color, "&HFFFFFF&")
+            self._osd_timer_outline_color_ass = _to_ass_bgr_color(outline_color, "&H000000&")
+        except Exception as e:
+            raise ValueError(str(e))
 
         # Normalize mpv OSD alignment if needed
         if mode == "anchor":
@@ -890,7 +928,9 @@ class VideoController:
 
         # Build ASS: style + rotation + position from anchor/margins
         font_tag = f"\\fn{font}" if font else ""
-        style_common = "\\bord4\\1c&HFFFFFF&\\3c&H000000&\\fad(0,0)"
+        tc = getattr(self, "_osd_timer_text_color_ass", "&HFFFFFF&")
+        oc = getattr(self, "_osd_timer_outline_color_ass", "&H000000&")
+        style_common = "\\bord4\\1c" + tc + "\\3c" + oc + "\\fad(0,0)"
         a = int(anchor); mx = int(margin_x); my = int(margin_y)
         if   a == 7: x_px, y_px = mx, my
         elif a == 8: x_px, y_px = CANVAS_W//2 + mx, my
@@ -1014,6 +1054,9 @@ class OSDTimerBody(BaseModel):
     y: Optional[float] = None
     margin_x: int = 40
     margin_y: int = 40
+
+    text_color: Optional[str] = None      # e.g. "#FFFFFF" (defaults to white)
+    outline_color: Optional[str] = None   # e.g. "#000000" (defaults to black)
 
 
 class MessageBody(BaseModel):
@@ -1141,16 +1184,20 @@ def osd_timer_start(body: OSDTimerBody):
     with _controller_lock:
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
-        _controller.start_osd_timer(
-            seconds=body.seconds,
-            rotation=body.rotation,
-            anchor=body.anchor,
-            font_size=body.font_size,
-            font=body.font,
-            position_mode=body.position_mode,
-            x=body.x, y=body.y,
-            margin_x=body.margin_x, margin_y=body.margin_y,
-        )
+        try:
+            _controller.start_osd_timer(
+                seconds=body.seconds,
+                rotation=body.rotation,
+                anchor=body.anchor,
+                font_size=body.font_size,
+                font=body.font,
+                position_mode=body.position_mode,
+                x=body.x, y=body.y,
+                margin_x=body.margin_x, margin_y=body.margin_y,
+                text_color=body.text_color, outline_color=body.outline_color,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     return {"status": "ok"}
 
 @app.post("/timer/osd/stop")
@@ -1230,11 +1277,14 @@ def cogs_timer_osd_start_get(
     y: float | None = None,
     margin_x: int = 40,
     margin_y: int = 40,
+    text_color: str | None = None,
+    outline_color: str | None = None,
 ):
     with _controller_lock:
         _controller.start_osd_timer(
             seconds, rotation, anchor, font_size, font,
-            position_mode, x, y, margin_x, margin_y
+            position_mode, x, y, margin_x, margin_y,
+            text_color, outline_color
         )
     return {"ok": True}
 
@@ -1242,18 +1292,23 @@ def cogs_timer_osd_start_get(
 async def cogs_timer_osd_start_post(request: Request):
     d = await _parse_noheader_body(request)
     with _controller_lock:
-        _controller.start_osd_timer(
-            int(d.get("seconds", 0)),
-            int(d.get("rotation", 180)),
-            int(d.get("anchor", 9)),
-            int(d.get("font_size", 72)),
-            d.get("font"),
-            str(d.get("position_mode", "anchor")),
-            float(d["x"]) if d.get("x") not in (None, "") else None,
-            float(d["y"]) if d.get("y") not in (None, "") else None,
-            int(d.get("margin_x", 40)),
-            int(d.get("margin_y", 40)),
-        )
+        try:
+            _controller.start_osd_timer(
+                int(d.get("seconds", 0)),
+                int(d.get("rotation", 180)),
+                int(d.get("anchor", 9)),
+                int(d.get("font_size", 72)),
+                d.get("font"),
+                str(d.get("position_mode", "anchor")),
+                float(d["x"]) if d.get("x") not in (None, "") else None,
+                float(d["y"]) if d.get("y") not in (None, "") else None,
+                int(d.get("margin_x", 40)),
+                int(d.get("margin_y", 40)),
+                d.get("text_color"),
+                d.get("outline_color"),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     return {"ok": True}
 
 @app.get("/cogs/timer/osd/pause")
