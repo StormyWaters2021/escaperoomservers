@@ -59,6 +59,8 @@ class MPVIPC:
         self._lock = threading.Lock()
         self._event_listeners = []
         self._running = False
+        self.persistent_volume = None
+
 
     def connect(self, timeout=10.0):
         start = time.monotonic()
@@ -571,24 +573,39 @@ class VideoController:
     def _on_mpv_event(self, msg: dict):
         if msg.get("event") == "file-loaded":
             try:
-                # Apply the intended loop mode for the file that just loaded
-                self.mpv.set_property("loop-file", "inf" if self._loop_for_next_file else "no")
+                # Apply loop mode
+                self.mpv.set_property(
+                    "loop-file",
+                    "inf" if self._loop_for_next_file else "no"
+                )
 
-                # If we were starting an interrupt, arm it *now* (after it really loaded)
+                # Arm interrupt if this was the interrupt file
                 try:
                     cur_path = self.mpv.get_property("path") or self.mpv.get_property("filename")
                 except Exception:
                     cur_path = None
+
                 if self._pending_interrupt_path:
                     want = self._pending_interrupt_path
-                    if cur_path and (str(cur_path) == want or os.path.basename(str(cur_path)) == os.path.basename(want)):
+                    if cur_path and (
+                        str(cur_path) == want or
+                        os.path.basename(str(cur_path)) == os.path.basename(want)
+                    ):
                         self.interrupt_active = True
                         self.interrupt_start = time.monotonic()
                         self._pending_interrupt_path = None
 
-                # Keep the timer visible and ensure playback continues
-                # self._reattach_timer_sub()
+                # Restore persistent volume after interrupt resumes
+                if self.persistent_volume is not None:
+                    self.mpv.set_property("volume", self.persistent_volume)
+                elif hasattr(self, "_restore_volume_after_resume"):
+                    if self._restore_volume_after_resume is not None:
+                        self.mpv.set_property("volume", self._restore_volume_after_resume)
+
+                    del self._restore_volume_after_resume
+
                 self.mpv.set_property("pause", False)
+
             except Exception:
                 pass
 
@@ -596,10 +613,16 @@ class VideoController:
             dt = 0.0
             if self.interrupt_mode == "skip":
                 dt = time.monotonic() - self.interrupt_start
+
             resume_at = max(0.0, self.saved_pos + dt)
+
+            # Store volume to restore after main loads
+            self._restore_volume_after_resume = getattr(self, "_saved_volume", None)
+
             if self.main_path:
-                self._loop_for_next_file = True   # main should loop
+                self._loop_for_next_file = True
                 self._play_file(self.main_path, loop=True, start=resume_at)
+
             self.interrupt_active = False
             self.interrupt_mode = None
 
@@ -688,7 +711,29 @@ class VideoController:
     def play_main(self, path: str):
         self.main_path = os.path.abspath(path)
         self._loop_for_next_file = True
+
+        # 1. Pause BEFORE loadfile to prevent audio burst
+        try:
+            self.mpv.set_property("pause", True)
+        except Exception:
+            pass
+
+        # 2. Load the file
         self._play_file(self.main_path, loop=True, start=None)
+
+        # 3. Apply persistent volume BEFORE playback resumes
+        if self.persistent_volume is not None:
+            try:
+                self.mpv.set_property("volume", self.persistent_volume)
+            except Exception:
+                pass
+
+        # 4. Resume with correct volume already set
+        try:
+            self.mpv.set_property("pause", False)
+        except Exception:
+            pass
+
 
 
     def get_time(self) -> float:
@@ -698,15 +743,29 @@ class VideoController:
         except Exception:
             return 0.0
 
-    def interrupt(self, path: str, mode: str):
+    def interrupt(self, path: str, mode: str, vol: int = 100):
         if not self.main_path:
             raise RuntimeError("Main video is not playing yet.")
+
+        # Clamp volume
+        interrupt_volume = max(0, min(100, int(vol)))
+
+        # Save current playback position
         self.saved_pos = self.get_time()
         self.interrupt_mode = mode
-        self._loop_for_next_file = False              # interrupt should not loop
+
+        # Save current volume only if persistent not being used
+        if self.persistent_volume is None:
+            self._saved_volume = self.mpv.get_property("volume") or 100
+        else:
+            self._saved_volume = self.persistent_volume
+
+
+        self._loop_for_next_file = False
         self._pending_interrupt_path = os.path.abspath(path)
-        # Do NOT set interrupt_active yet; arm it on file-loaded for this path
+
         self._play_file(path, loop=False, start=None)
+
 
 
     def overlay_text(self, text: str, font: Optional[str], size: Optional[int],
@@ -1217,42 +1276,54 @@ def cogs_timer_osd_stop_get():
 
 # ---------- INTERRUPT (headerless, for COGS) ----------
 @app.get("/cogs/interrupt/return")
-def cogs_interrupt_return_get(path: str):
+def cogs_interrupt_return_get(path: str, vol: int = 100):
     with _controller_lock:
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
-        _controller.interrupt(path, "return")
+        _controller.interrupt(path, "return", vol)
     return {"ok": True}
 
+
 @app.get("/cogs/interrupt/skip")
-def cogs_interrupt_skip_get(path: str):
+def cogs_interrupt_skip_get(path: str, vol: int = 100):
     with _controller_lock:
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
-        _controller.interrupt(path, "skip")
+        _controller.interrupt(path, "skip", vol)
     return {"ok": True}
+
 
 @app.post("/cogs/interrupt/return")
 async def cogs_interrupt_return_post(request: Request):
-    d = await _parse_noheader_body(request)  # supports raw "path=/foo/bar.mp4" or JSON
+    d = await _parse_noheader_body(request)
     if not d.get("path"):
         raise HTTPException(400, "missing 'path'")
+
+    vol = int(d.get("vol", 100))
+
     with _controller_lock:
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
-        _controller.interrupt(str(d["path"]), "return")
+        _controller.interrupt(str(d["path"]), "return", vol)
+
     return {"ok": True}
+
 
 @app.post("/cogs/interrupt/skip")
 async def cogs_interrupt_skip_post(request: Request):
     d = await _parse_noheader_body(request)
     if not d.get("path"):
         raise HTTPException(400, "missing 'path'")
+
+    vol = int(d.get("vol", 100))
+
     with _controller_lock:
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
-        _controller.interrupt(str(d["path"]), "skip")
+        _controller.interrupt(str(d["path"]), "skip", vol)
+
     return {"ok": True}
+
 
 @app.get("/cogs/play")
 def cogs_play_get(path: str):
@@ -1261,6 +1332,7 @@ def cogs_play_get(path: str):
             raise HTTPException(500, "Controller not initialized")
         _controller.play_main(path)
     return {"ok": True}
+
 
 @app.post("/cogs/play")
 async def cogs_play_post(request: Request):
@@ -1303,6 +1375,27 @@ def cogs_overlay_path(rotate_deg: int, align: str, margin_x: int, margin_y: int,
             rotate_deg=int(rotate_deg),
         )
     return {"ok": True}
+
+
+@app.get("/cogs/volume")
+def cogs_set_volume(level: int):
+    with _controller_lock:
+        if not _controller:
+            raise HTTPException(500, "Controller not initialized")
+
+        vol = max(0, min(100, int(level)))
+
+        # Store persistent volume
+        _controller.persistent_volume = vol
+
+        # Apply immediately
+        try:
+            _controller.mpv.set_property("volume", vol)
+        except Exception:
+            pass
+
+    return {"ok": True, "volume": vol}
+
 
 
 # ======== Entrypoint ========
