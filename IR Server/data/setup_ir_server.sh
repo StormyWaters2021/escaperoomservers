@@ -14,6 +14,8 @@ APP_PY="${APP_DIR}/ir_server.py"
 SIGNALS_DIR="${APP_DIR}/signals"
 SERVICE="ir-server.service"
 
+PORT="${PORT:-8001}"
+
 # Defaults (kept for parity with your prior installer; can be used by a future server update)
 IR_TX_GPIO="${IR_TX_GPIO:-22}"
 IR_RX_GPIO="${IR_RX_GPIO:-23}"
@@ -65,7 +67,7 @@ Environment=IR_TX_GPIO=${IR_TX_GPIO}
 Environment=IR_RX_GPIO=${IR_RX_GPIO}
 Environment=IR_CARRIER_KHZ=${IR_CARRIER_KHZ}
 # If you later update ir_server.py to read these env vars, they'll be ready.
-ExecStart=${VENV_DIR}/bin/uvicorn ir_server:app --host 0.0.0.0 --port 8001
+ExecStart=${VENV_DIR}/bin/uvicorn ir_server:app --host 0.0.0.0 --port ${PORT}
 Restart=on-failure
 RestartSec=2
 
@@ -78,7 +80,7 @@ EOF
   systemctl restart pigpiod
   systemctl restart "${SERVICE}"
 
-  echo "[+] Installed. Service: ${SERVICE} (port 8001)"
+  echo "[+] Installed. Service: ${SERVICE} (port ${PORT})"
   echo "    Disable on boot:"
   echo "      sudo touch /etc/ir-server.disabled"
   echo "      # or create 'server.disable' on the boot partition (Windows-visible: /boot/firmware)"
@@ -99,6 +101,14 @@ remove_all() {
   echo "    To delete app files: sudo rm -rf ${APP_DIR}"
 }
 
+
+info_srv(){
+  echo "Server: IR Server"
+  echo "Service: ${SERVICE}"
+  echo "App: ${APP_PY}"
+  echo "Port: ${PORT}"
+}
+
 case "${1:-}" in
   install) ensure_deps; install_app ;;
   disable) disable_srv ;;
@@ -106,8 +116,9 @@ case "${1:-}" in
   start)   start_srv ;;
   stop)    stop_srv ;;
   status)  status_srv ;;
+  info)    info_srv ;;
   remove)  remove_all ;;
   *)
-    echo "Usage: sudo bash $0 {install|enable|disable|start|stop|status|remove}"
+    echo "Usage: sudo bash $0 {install|enable|disable|start|stop|status|info|remove}"
     exit 1 ;;
 esac

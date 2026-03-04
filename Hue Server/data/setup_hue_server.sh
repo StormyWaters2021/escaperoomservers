@@ -16,7 +16,7 @@ DISABLE_FLAG_ETC="/etc/hue-server.disabled"
 BOOT_FLAG_1="/boot/hue.disable"
 BOOT_FLAG_2="/boot/firmware/hue.disable"
 
-# Defaults (can override via env or 'set-port')
+# Defaults (can override via env or 'set-port | info')
 PORT="${PORT:-8002}"
 HUE_CONFIG="${HUE_CONFIG:-$APP_DIR/hue_config.json}"
 
@@ -44,7 +44,7 @@ Commands:
   enable            Remove disable flag and restart service
   boot-disable      Touch /boot*/hue.disable and stop service (Windows-visible)
   boot-enable       Remove boot flag(s) and restart service
-  set-port N        Change service port to N and restart
+  set-port | info N        Change service port to N and restart
   uninstall         Remove service and app directory
 
 Env overrides: SERVICE_USER, APP_DIR, VENVDIR, PORT, HUE_CONFIG, APP_ENTRY, APP_FILE_LOCAL
@@ -155,12 +155,19 @@ cmd_boot_enable(){
   systemctl restart "$SERVICE_NAME" || true
 }
 
+cmd_info(){
+  echo "Server: Hue Server"
+  echo "Service: ${SERVICE_NAME}"
+  echo "App: ${APP_DIR}/${APP_FILE_LOCAL}"
+  echo "Port: ${PORT}"
+}
+
 cmd_set_port(){
   require_root
   local new="${1:-}"
   # Validate integer 1..65535
   if [[ -z "$new" || ! "$new" =~ ^[0-9]+$ || "$new" -lt 1 || "$new" -gt 65535 ]]; then
-    echo "Usage: $0 set-port <1-65535>"
+    echo "Usage: $0 set-port | info <1-65535>"
     exit 2
   fi
   PORT="$new"
@@ -196,7 +203,8 @@ main() {
     enable)         shift; cmd_enable "$@";;
     boot-disable)   shift; cmd_boot_disable "$@";;
     boot-enable)    shift; cmd_boot_enable "$@";;
-    set-port)       shift; cmd_set_port "${1:-}";;
+    set-port | info)       shift; cmd_set_port "${1:-}";;
+    info)           cmd_info;;
     uninstall)      shift; cmd_uninstall "$@";;
     -h|--help|help|"") usage;;
     *) echo "Unknown command: $cmd"; usage; exit 2;;
