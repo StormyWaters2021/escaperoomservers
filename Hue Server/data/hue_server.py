@@ -22,6 +22,33 @@ DEVICETYPE = "hue-server#pi"  # registration identifier
 
 app = FastAPI(title=APP_TITLE, version="1.1")
 
+
+# ---------- Color presets (name -> Hue state) ----------
+
+# Keys are normalized by: lowercased, "_" and "-" removed
+COLOR_PRESETS = {
+    # Pure colors (hue/sat)
+    "red":        {"hue": 0,     "sat": 254},
+    "orange":     {"hue": 6500,  "sat": 254},
+    "yellow":     {"hue": 12750, "sat": 254},
+    "green":      {"hue": 25500, "sat": 254},
+    "cyan":       {"hue": 35000, "sat": 254},
+    "blue":       {"hue": 46920, "sat": 254},
+    "purple":     {"hue": 56100, "sat": 254},
+    "pink":       {"hue": 56100, "sat": 180},
+    "magenta":    {"hue": 56100, "sat": 254},
+    "mint":       {"hue": 20000, "sat": 120},
+    "peach":      {"hue": 8000,  "sat": 180},
+
+    # Whites (color temperature)
+    "coolwhite":  {"ct": 153},  # ≈ 6500K
+    "daylight":   {"ct": 200},  # ≈ 5000K
+    "neutral":    {"ct": 300},  # ≈ 3500K
+    "warmwhite":  {"ct": 370},  # ≈ 2700K
+    "candle":     {"ct": 450},  # ≈ 2200K
+    "softwhite":  {"ct": 400},  # slightly warmer than warmwhite
+}
+
 # ---------- Config helpers ----------
 def _ensure_cfg_dir():
     d = os.path.dirname(CFG_PATH)
@@ -86,6 +113,16 @@ def _set_on_state(cfg, light_id: str, on: bool):
 def _get_light_state(cfg, light_id: str) -> Optional[bool]:
     data = hue_get(cfg, f"/lights/{light_id}")
     return bool(data.get("state", {}).get("on"))
+
+
+def _get_light_bri(cfg, light_id: str) -> int:
+    """
+    Return the light's current brightness (0–254).
+    If unavailable, returns 0.
+    """
+    data = hue_get(cfg, f"/lights/{light_id}")
+    return int(data.get("state", {}).get("bri", 0) or 0)
+    
 
 def _confirm_state(cfg, light_id: str, want_on: bool, retries: int = 5, delay_s: float = 0.1) -> bool:
     """
@@ -252,3 +289,163 @@ def hue_map_all():
             added += 1
     save_cfg(cfg)
     return {"ok": True, "mapped_count": added}
+    
+
+# ---------- NEW COGS endpoint: color by name ----------
+
+def _norm_color_name(color: str) -> str:
+    """
+    Normalize a color name:
+    - lowercase
+    - remove underscores and dashes
+    - strip spaces
+    Examples:
+      "Warm_White" -> "warmwhite"
+      "cool-white" -> "coolwhite"
+    """
+    return color.lower().replace("_", "").replace("-", "").strip()
+
+
+@app.get("/cogs/hue/color/name/{name}/{color}")
+def cogs_hue_color_name(name: str, color: str):
+    """
+    Set a light's color using a simple color name, via COGS trigger.
+    Examples:
+      /cogs/hue/color/name/Desk_Light/red
+      /cogs/hue/color/name/Lamp/warm_white
+      /cogs/hue/color/name/Office/cool-white
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+
+    color_key = _norm_color_name(color)
+    preset = COLOR_PRESETS.get(color_key)
+    if not preset:
+        # Provide a helpful error listing supported colors
+        supported = sorted(COLOR_PRESETS.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown color '{color}'. Supported colors: {', '.join(supported)}"
+        )
+
+    # Build the state body; always turn the light on when setting a color
+    body = {"on": True}
+    body.update(preset)
+
+    res = hue_put(cfg, f"/lights/{lid}/state", body)
+
+    return {
+        "ok": True,
+        "name": _norm_name(name),
+        "light_id": lid,
+        "color": color_key,
+        "state_sent": body,
+        "bridge_response": res,
+    }
+    
+
+@app.get("/cogs/hue/bri/{name}/{percent}")
+def cogs_hue_brightness(name: str, percent: int):
+    """
+    Set brightness as a percentage (0–100) via COGS trigger.
+    Internally mapped to Hue 'bri' 0–254.
+    0% = as dark as possible without turning the light fully off.
+    Use /cogs/hue/off/{name} to actually turn it off.
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+
+    # Clamp percentage 0–100
+    percent = max(0, min(100, int(percent)))
+
+    # Map 0–100% -> 0–254 bri
+    bri = round(percent * 254 / 100)
+
+    # If we asked for >0% but rounding gave 0, force minimum non-zero
+    if percent > 0 and bri == 0:
+        bri = 1
+
+    hue_put(cfg, f"/lights/{lid}/state", {"bri": bri})
+
+    return {
+        "ok": True,
+        "name": _norm_name(name),
+        "light_id": lid,
+        "percent": percent,
+        "bri": bri,
+    }
+
+
+@app.get("/cogs/hue/bri/up/{name}/{delta}")
+def cogs_hue_brightness_up(name: str, delta: int):
+    """
+    Increase brightness by a percentage delta (0–100).
+    Example: /cogs/hue/bri/up/Desk_Lamp/10  -> +10%
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+
+    # Current brightness in 0–254
+    bri_now = _get_light_bri(cfg, lid)
+    percent_now = round(bri_now * 100 / 254)
+
+    # Clamp delta and compute new percentage
+    delta = max(0, min(100, int(delta)))
+    target_percent = max(0, min(100, percent_now + delta))
+
+    # Reuse the main percentage setter
+    return cogs_hue_brightness(name, target_percent)
+
+
+@app.get("/cogs/hue/bri/down/{name}/{delta}")
+def cogs_hue_brightness_down(name: str, delta: int):
+    """
+    Decrease brightness by a percentage delta (0–100).
+    Example: /cogs/hue/bri/down/Desk_Lamp/10  -> -10%
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+
+    bri_now = _get_light_bri(cfg, lid)
+    percent_now = round(bri_now * 100 / 254)
+
+    delta = max(0, min(100, int(delta)))
+    target_percent = max(0, min(100, percent_now - delta))
+
+    return cogs_hue_brightness(name, target_percent)
+    
+
+@app.get("/cogs/hue/color/hs/{name}/{hue}/{sat}")
+def cogs_hue_color_hs(name: str, hue: int, sat: int):
+    """
+    Set color using Hue/Sat (full RGB color).
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+    hue = max(0, min(65535, int(hue)))
+    sat = max(0, min(254, int(sat)))
+    hue_put(cfg, f"/lights/{lid}/state", {"hue": hue, "sat": sat})
+    return {"ok": True, "light_id": lid, "hue": hue, "sat": sat}
+
+
+@app.get("/cogs/hue/color/ct/{name}/{mireds}")
+def cogs_hue_color_ct(name: str, mireds: int):
+    """
+    Set color temperature (153–500 mireds).
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+    mireds = max(153, min(500, int(mireds)))
+    hue_put(cfg, f"/lights/{lid}/state", {"ct": mireds})
+    return {"ok": True, "light_id": lid, "ct": mireds}
+
+
+@app.get("/cogs/hue/color/xy/{name}/{x}/{y}")
+def cogs_hue_color_xy(name: str, x: float, y: float):
+    """
+    Set XY color coordinates.
+    """
+    cfg = load_cfg(); require_bridge(cfg)
+    lid = _resolve_light_id_by_name(cfg, name)
+    hue_put(cfg, f"/lights/{lid}/state", {"xy": [float(x), float(y)]})
+    return {"ok": True, "light_id": lid, "xy": [x, y]}

@@ -1,0 +1,21 @@
+{
+  "bridge_ip": "192.168.50.140",
+  "username": "Br5R4CH06vRCu2TuLT7FC-SI-IDSz5FLwBOG43HY",
+  "map": {
+    "Pentagram Wall Plugs": "2",
+    "Pentagram Lights": "3",
+    "Fountain": "4",
+    "Blacklight": "5",
+    "Fan": "6",
+    "Mom Light": "7",
+    "Mom Portrait": "8",
+    "Spotlights": "9",
+    "Sconce Light": "10",
+    "Mirror and Portrait": "11",
+    "Focused Spotlights": "12",
+    "Back Ceiling Light": "13",
+    "Front Ceiling Light": "14",
+    "Back Ceiling Light 2": "15",
+    "Front Ceiling Light 2": "16"
+  }
+}
