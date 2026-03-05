@@ -177,6 +177,11 @@ cmd_info() {
   echo "Service: ${SERVICE}"
   echo "App: ${APP_DIR}/video_server.py"
   echo "Port: ${PORT}"
+  echo "Resources:"
+  echo "  mpv IPC socket: /run/video-server/mpv.sock (env MPV_SOCKET_PATH=/run/video-server/mpv.sock)"
+  echo "  Video paths: the server plays the exact path you pass to /play (absolute path recommended)."
+  echo "  Relative paths resolve under WorkingDirectory: ${APP_DIR}"
+  echo "  Installer-created convenience folder: /home/${RUN_USER}/Videos (not auto-scanned)"
 }
 
 cmd_install() {
