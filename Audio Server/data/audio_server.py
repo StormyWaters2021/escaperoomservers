@@ -14,7 +14,7 @@ import uvicorn
 # ==========================================================
 
 # CHANGE THIS to where your WAV files are stored
-AUDIO_FOLDER = os.getenv("AUDIO_FOLDER", "./audio_files/")
+AUDIO_FOLDER = "./audio_files/"
 
 TARGET_RATE = 44100
 CHUNK = 1024
@@ -266,8 +266,7 @@ def stop_audio():
     ir_pos = 0
 
     return {"status": "ok", "message": "audio stopped"}
-    
-    
+
 # -------- GLOBAL MASTER VOLUME --------
 
 @app.get("/audio/set_volume/{vol}")
