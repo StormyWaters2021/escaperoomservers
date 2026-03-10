@@ -36,7 +36,7 @@ install_apt() {
 
 prepare_user_env() {
   msg "Ensuring ${RUN_USER} has video access..."
-  usermod -aG video,render "$RUN_USER" || true
+  usermod -aG video,render,audio "$RUN_USER" || true
   mkdir -p "/home/${RUN_USER}/Videos"
   chown -R "${RUN_USER}:${RUN_USER}" "/home/${RUN_USER}/Videos"
 }
@@ -116,6 +116,7 @@ Type=simple
 User=${RUN_USER}
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
+Environment=MPV_SOCKET_PATH=/run/video-server/mpv.sock
 ExecStart=/usr/local/bin/${APP_NAME}-run.sh
 StandardOutput=journal
 StandardError=journal
@@ -131,6 +132,8 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=false
 PrivateTmp=true
+RuntimeDirectory=video-server
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
@@ -169,6 +172,18 @@ post_checks() {
   echo "  ${BD}/video-server.disable"
 }
 
+cmd_info() {
+  echo "Server: Video Server"
+  echo "Service: ${SERVICE}"
+  echo "App: ${APP_DIR}/video_server.py"
+  echo "Port: ${PORT}"
+  echo "Resources:"
+  echo "  mpv IPC socket: /run/video-server/mpv.sock (env MPV_SOCKET_PATH=/run/video-server/mpv.sock)"
+  echo "  Video paths: the server plays the exact path you pass to /play (absolute path recommended)."
+  echo "  Relative paths resolve under WorkingDirectory: ${APP_DIR}"
+  echo "  Installer-created convenience folder: /home/${RUN_USER}/Videos (not auto-scanned)"
+}
+
 cmd_install() {
   require_root
   msg "Installing from local repo: ${REPO_ROOT}"
@@ -185,5 +200,6 @@ cmd_install() {
 
 case "${1:-install}" in
   install) cmd_install;;
-  *) echo "Usage: $0 [install]"; exit 1;;
+  info) cmd_info;;
+  *) echo "Usage: $0 {install|info}"; exit 1;;
 esac

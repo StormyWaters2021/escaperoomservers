@@ -16,10 +16,10 @@ import atexit
 # =========================
 # Config (edit as needed)
 # =========================
-TX_GPIO = 18                 # IR LED output pin (via transistor)
-RX_GPIO = 23                 # IR receiver (demodulated) input pin (TSOP style)
-CARRIER_KHZ_DEFAULT = 38.0   # default carrier
-SIGNALS_DIR = "./signals"    # where learned signals are stored
+TX_GPIO = int(os.getenv("IR_TX_GPIO", "18"))  # IR LED output pin (via transistor)
+RX_GPIO = int(os.getenv("IR_RX_GPIO", "23"))  # IR receiver (demodulated) input pin (TSOP style)
+CARRIER_KHZ_DEFAULT = float(os.getenv("IR_CARRIER_KHZ", "38.0"))  # default carrier
+SIGNALS_DIR = os.getenv("IR_SIGNALS_DIR", "./signals")  # where learned signals are stored
 LONG_GAP_US = 7000           # gap threshold to split frames (us)
 TOLERANCE_PCT = 0.2          # timing compare tolerance for repeat detection (20%)
 ROUND_TO_US = 50             # normalize durations to nearest N us for storage
@@ -33,25 +33,9 @@ app = FastAPI(title="IR Learn/Send Server", version="1.1 (COGS-style URLs)")
 # =========================
 # pigpio init
 # =========================
-def ensure_pigpiod():
-    try:
-        pi = pigpio.pi()
-        if not pi.connected:
-            raise RuntimeError("pigpio not connected")
-        pi.stop()
-        return
-    except Exception:
-        pass
-    try:
-        subprocess.run(["sudo", "pigpiod"], check=False)
-        time.sleep(0.2)
-    except Exception:
-        pass
-
-ensure_pigpiod()
 pi = pigpio.pi()
 if not pi.connected:
-    raise SystemExit("Unable to connect to pigpio. Ensure pigpiod is running: sudo pigpiod")
+    raise SystemExit("Unable to connect to pigpio. Ensure pigpiod is running (systemd): sudo systemctl enable --now pigpiod")
 
 pi.set_mode(TX_GPIO, pigpio.OUTPUT)
 pi.set_mode(RX_GPIO, pigpio.INPUT)

@@ -74,6 +74,10 @@ async def _parse_noheader_body(request: Request) -> dict:
 # --- Added for better diagnostics ---
 import traceback, logging, pathlib
 
+
+# mpv IPC socket location (overridable via env for systemd RuntimeDirectory)
+DEFAULT_MPV_SOCKET_PATH = "/run/video-server/mpv.sock"
+MPV_SOCKET_PATH = os.getenv("MPV_SOCKET_PATH", DEFAULT_MPV_SOCKET_PATH)
 TOAST_WRAP_CHARS = 15   # ← change this to whatever wrap length you want
 
 # ======== mpv JSON IPC helper ========
@@ -206,7 +210,7 @@ class MPVIPC:
 
 class VideoController:
     def __init__(self, main_path: Optional[str], fullscreen: bool):
-        self.socket_path = "/tmp/mpv-video.sock"
+        self.socket_path = MPV_SOCKET_PATH
         self.main_path = os.path.abspath(main_path) if main_path else None
         self._proc = None
         self.mpv = None
@@ -269,6 +273,14 @@ class VideoController:
 
 
     def _start_mpv(self, fullscreen: bool):
+        # Ensure the socket directory exists (systemd RuntimeDirectory is ideal, but this keeps dev runs working)
+        try:
+            sock_dir = os.path.dirname(self.socket_path)
+            if sock_dir:
+                os.makedirs(sock_dir, exist_ok=True)
+        except Exception:
+            pass
+
         if os.path.exists(self.socket_path):
             try:
                 os.remove(self.socket_path)
