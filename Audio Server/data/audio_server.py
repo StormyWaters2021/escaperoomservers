@@ -251,6 +251,23 @@ def interrupt_right(file: str, vol: int):
 def interrupt_right_default(file: str):
     return interrupt_right(file, 100)
 
+
+@app.get("/audio/stop")
+def stop_audio():
+    global bg_buffer, bg_pos
+    global interrupt_L, interrupt_R, il_pos, ir_pos
+
+    bg_buffer = None
+    bg_pos = 0
+
+    interrupt_L = None
+    interrupt_R = None
+    il_pos = 0
+    ir_pos = 0
+
+    return {"status": "ok", "message": "audio stopped"}
+    
+    
 # -------- GLOBAL MASTER VOLUME --------
 
 @app.get("/audio/set_volume/{vol}")
