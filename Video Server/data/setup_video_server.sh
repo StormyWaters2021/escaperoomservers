@@ -44,7 +44,7 @@ prepare_user_env() {
 find_src_dir() {
   # Find the server folder that contains data/video_server.py inside the already-cloned repo
   local m
-  m="$(grep -ril --exclude-dir=.git --include=video_server.py '^' "$REPO_ROOT" 2>/dev/null | grep '/data/video_server.py' || true)"
+  m="$(find "$REPO_ROOT" -type f -path "*/data/video_server.py" -print 2>/dev/null | head -n 1 || true)"
   if [[ -z "$m" ]]; then
     echo "ERROR: Could not locate data/video_server.py under $REPO_ROOT" >&2
     exit 1
@@ -76,9 +76,9 @@ deploy_files() {
 create_venv() {
   msg "Creating Python venv + pip deps..."
   if [[ ! -x "${APP_DIR}/.venv/bin/python" ]]; then
-    sudo -u "${RUN_USER}" python3 -m venv "${APP_DIR}/.venv"
+    sudo -u "${RUN_USER}" -H python3 -m venv "${APP_DIR}/.venv"
   fi
-  sudo -u "${RUN_USER}" bash -lc "
+  sudo -u "${RUN_USER}" -H bash -lc "
     set -e
     source '${APP_DIR}/.venv/bin/activate'
     python -m pip install -U pip wheel
@@ -117,7 +117,6 @@ User=${RUN_USER}
 WorkingDirectory=${APP_DIR}
 RuntimeDirectory=video-server
 RuntimeDirectoryMode=0755
-Environment=MPV_SOCKET_PATH=/run/video-server/mpv.sock
 Environment=PYTHONUNBUFFERED=1
 Environment=MPV_SOCKET_PATH=/run/video-server/mpv.sock
 ExecStart=/usr/local/bin/${APP_NAME}-run.sh
@@ -135,8 +134,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=false
 PrivateTmp=true
-RuntimeDirectory=video-server
-RuntimeDirectoryMode=0755
+
 
 [Install]
 WantedBy=multi-user.target

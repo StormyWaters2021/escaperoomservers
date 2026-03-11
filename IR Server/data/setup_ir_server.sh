@@ -59,24 +59,25 @@ ensure_deps() {
 install_app() {
   log "Installing IR server to ${APP_DIR} (user: ${RUN_USER})"
   mkdir -p "${APP_DIR}" "${SIGNALS_DIR}"
+  chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" || true
 
   # Copy Python from repo
   [[ -f "$SRC_PY" ]] || { echo "ERROR: Source not found: $SRC_PY" >&2; exit 1; }
   sed -i 's/\r$//' "$SRC_PY" >/dev/null 2>&1 || true
   install -m 0644 "$SRC_PY" "$APP_PY"
+  chown "$RUN_USER:$RUN_USER" "$APP_PY" || true
 
   # Python venv + deps
   if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    sudo -u "$RUN_USER" python3 -m venv "${VENV_DIR}"
+    sudo -u "$RUN_USER" -H python3 -m venv "${VENV_DIR}"
   fi
-  sudo -u "$RUN_USER" bash -lc "
+  sudo -u "$RUN_USER" -H bash -lc "
     set -e
     source '${VENV_DIR}/bin/activate'
     python -m pip install --upgrade pip wheel
     python -m pip install fastapi uvicorn pigpio pigpio-daemon pydantic
   "
 
-  chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" || true
   # Ensure pigpiod is running.
   # Prefer systemd service if it exists; otherwise try launching pigpiod directly (from pip pigpio-daemon).
   if command -v systemctl >/dev/null 2>&1 && systemctl status pigpiod.service >/dev/null 2>&1; then

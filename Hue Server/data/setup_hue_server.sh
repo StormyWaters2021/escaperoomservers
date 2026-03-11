@@ -95,10 +95,14 @@ install_app() {
   install -m 0644 "$SRC_PY" "$APP_PY"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 
-  # Create/upgrade venv + deps
-  python3 -m venv "$VENVDIR"
-  "$VENVDIR/bin/pip" install --upgrade pip wheel
-  "$VENVDIR/bin/pip" install fastapi uvicorn requests
+  # Create/upgrade venv + deps (as service user)
+  sudo -u "$SERVICE_USER" -H python3 -m venv "$VENVDIR"
+  sudo -u "$SERVICE_USER" -H bash -lc "
+    set -e
+    source '$VENVDIR/bin/activate'
+    python -m pip install --upgrade pip wheel
+    python -m pip install fastapi uvicorn requests
+  "
 
   # Default config, if missing
   if [[ ! -f "$HUE_CONFIG" ]]; then
