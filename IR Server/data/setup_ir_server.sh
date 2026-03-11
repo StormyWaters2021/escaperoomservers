@@ -46,14 +46,45 @@ ensure_deps() {
   apt-get update || true
   apt-get install -y python3 python3-venv python3-pip
 
-  # Try to install pigpiod from apt if available (Pi OS / some repos)
+  # If pigpiod is available from apt, use it.
   if apt-cache show pigpiod >/dev/null 2>&1; then
     apt-get install -y pigpiod || true
     systemctl enable --now pigpiod 2>/dev/null || true
     log "Installed pigpiod from apt."
-  else
-    log "pigpiod not available via apt on this system; will use pip-installed pigpio-daemon if needed."
+    return 0
   fi
+
+  log "pigpiod not available via apt. Building pigpio (pigpiod) from source..."
+
+  # Build dependencies for pigpio
+  apt-get install -y git make gcc libc6-dev
+
+  local TMP="/tmp/pigpio-src"
+  rm -rf "$TMP"
+  git clone --depth 1 https://github.com/joan2937/pigpio.git "$TMP"
+  make -C "$TMP"
+  make -C "$TMP" install
+
+  # Install a systemd unit for pigpiod if the OS doesn't provide one
+  if [[ ! -f /etc/systemd/system/pigpiod.service && ! -f /lib/systemd/system/pigpiod.service ]]; then
+    cat > /etc/systemd/system/pigpiod.service <<'EOF'
+[Unit]
+Description=pigpio daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pigpiod -g
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now pigpiod 2>/dev/null || true
+  log "Installed pigpiod from source + enabled pigpiod.service."
 }
 
 install_app() {
@@ -75,28 +106,19 @@ install_app() {
     set -e
     source '${VENV_DIR}/bin/activate'
     python -m pip install --upgrade pip wheel
-    python -m pip install fastapi uvicorn pigpio pigpio-daemon pydantic
+    python -m pip install fastapi uvicorn pigpio pydantic
   "
 
   # Ensure pigpiod is running.
-  # Prefer systemd service if it exists; otherwise try launching pigpiod directly (from pip pigpio-daemon).
-  if command -v systemctl >/dev/null 2>&1 && systemctl status pigpiod.service >/dev/null 2>&1; then
-    systemctl enable --now pigpiod 2>/dev/null || true
-  else
-    # Try venv pigpiod first, then system PATH
-    if [[ -x "${VENV_DIR}/bin/pigpiod" ]]; then
-      "${VENV_DIR}/bin/pigpiod" 2>/dev/null || true
-    elif command -v pigpiod >/dev/null 2>&1; then
-      pigpiod 2>/dev/null || true
-    fi
-  fi
+  # Ensure pigpiod is running (installed from apt if available, otherwise built from source above).
+  systemctl enable --now pigpiod 2>/dev/null || true
 
   # systemd unit
   cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
 Description=IR Server (FastAPI + pigpio, COGS endpoints)
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target pigpiod.service
+After=network-online.target pigpiod.service
 ConditionPathExists=!${DISABLE_FLAG_ETC}
 ConditionPathExists=!${BOOT_FLAG_1}
 ConditionPathExists=!${BOOT_FLAG_2}
