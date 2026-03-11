@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-### ------------ Config (no git pulls here) ------------
+### ------------ Config ------------
 APP_NAME="video-server"
 APP_DIR="/opt/${APP_NAME}"
 SERVICE="${APP_NAME}.service"
@@ -115,6 +115,9 @@ ConditionPathExists=!/boot/video-server.disable
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${APP_DIR}
+RuntimeDirectory=video-server
+RuntimeDirectoryMode=0755
+Environment=MPV_SOCKET_PATH=/run/video-server/mpv.sock
 Environment=PYTHONUNBUFFERED=1
 Environment=MPV_SOCKET_PATH=/run/video-server/mpv.sock
 ExecStart=/usr/local/bin/${APP_NAME}-run.sh

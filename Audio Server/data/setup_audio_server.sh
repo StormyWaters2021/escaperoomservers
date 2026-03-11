@@ -121,6 +121,7 @@ EOF
 do_install(){
   require_root
   apt_install
+  ensure_dirs
   ensure_venv
   deploy_app
   write_service

@@ -19,7 +19,8 @@ import atexit
 TX_GPIO = int(os.getenv("IR_TX_GPIO", "18"))  # IR LED output pin (via transistor)
 RX_GPIO = int(os.getenv("IR_RX_GPIO", "23"))  # IR receiver (demodulated) input pin (TSOP style)
 CARRIER_KHZ_DEFAULT = float(os.getenv("IR_CARRIER_KHZ", "38.0"))  # default carrier
-SIGNALS_DIR = os.getenv("IR_SIGNALS_DIR", "./signals")  # where learned signals are stored
+DEFAULT_SIGNALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals")
+SIGNALS_DIR = os.getenv("IR_SIGNALS_DIR", DEFAULT_SIGNALS_DIR)
 LONG_GAP_US = 7000           # gap threshold to split frames (us)
 TOLERANCE_PCT = 0.2          # timing compare tolerance for repeat detection (20%)
 ROUND_TO_US = 50             # normalize durations to nearest N us for storage
@@ -406,7 +407,8 @@ signal.signal(signal.SIGINT, handle_sigterm)
 # Main
 # =========================
 if __name__ == "__main__":
-    uvicorn.run("ir_server:app", host="0.0.0.0", port=8001, reload=False)
+    port = int(os.getenv("PORT", "8001"))
+    uvicorn.run("ir_server:app", host="0.0.0.0", port=port, reload=False)
 
 
 
