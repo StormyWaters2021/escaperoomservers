@@ -61,8 +61,9 @@ apt_install(){
   if apt-get install -y python3-numpy python3-alsaaudio; then
     log "Installed python3-numpy and python3-alsaaudio from apt."
   else
-    log "Could not install python3-numpy/python3-alsaaudio from apt; falling back to pip build deps."
-    apt-get install -y build-essential libasound2-dev || true
+    log "Could not install python3-numpy/python3-alsaaudio from apt. These are required."
+    log "Fix your apt sources, then run: sudo apt-get install -y python3-numpy python3-alsaaudio"
+    exit 1
   fi
 }
 
@@ -76,8 +77,19 @@ ensure_venv(){
     source '$VENV_DIR/bin/activate'
     python -m pip install --upgrade pip wheel
     python -m pip install fastapi 'uvicorn[standard]'
-    # If numpy/alsaaudio weren't installed via apt, these will satisfy imports (may compile)
-    python -m pip install --upgrade numpy pyalsaaudio || true
+    # Do NOT pip-install pyalsaaudio: it often compiles and needs libasound2-dev.
+    # We rely on apt packages (python3-alsaaudio, python3-numpy) exposed via --system-site-packages.
+    python - <<'PY'
+import sys
+try:
+  import alsaaudio  # provided by python3-alsaaudio
+  import numpy      # provided by python3-numpy
+  print('OK: alsaaudio and numpy import successfully')
+except Exception as e:
+  print('ERROR: missing required system packages in venv:', repr(e))
+  print('Install: sudo apt-get install -y python3-alsaaudio python3-numpy')
+  sys.exit(1)
+PY
   "
 }
 

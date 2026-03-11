@@ -10,7 +10,6 @@ import uvicorn
 import pigpio
 import threading
 import signal
-import subprocess
 import atexit
 
 # =========================

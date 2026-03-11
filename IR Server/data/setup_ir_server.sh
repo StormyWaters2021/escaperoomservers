@@ -44,7 +44,7 @@ log(){ echo "[$APP_NAME] $*"; }
 ensure_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update || true
-  apt-get install -y python3 python3-venv python3-pip pigpio
+  apt-get install -y python3 python3-venv python3-pip pigpiod
   systemctl enable --now pigpiod
 }
 
