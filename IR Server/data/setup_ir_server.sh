@@ -44,8 +44,16 @@ log(){ echo "[$APP_NAME] $*"; }
 ensure_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update || true
-  apt-get install -y python3 python3-venv python3-pip pigpiod
-  systemctl enable --now pigpiod
+  apt-get install -y python3 python3-venv python3-pip
+
+  # Try to install pigpiod from apt if available (Pi OS / some repos)
+  if apt-cache show pigpiod >/dev/null 2>&1; then
+    apt-get install -y pigpiod || true
+    systemctl enable --now pigpiod 2>/dev/null || true
+    log "Installed pigpiod from apt."
+  else
+    log "pigpiod not available via apt on this system; will use pip-installed pigpio-daemon if needed."
+  fi
 }
 
 install_app() {
@@ -65,17 +73,29 @@ install_app() {
     set -e
     source '${VENV_DIR}/bin/activate'
     python -m pip install --upgrade pip wheel
-    python -m pip install fastapi uvicorn pigpio pydantic
+    python -m pip install fastapi uvicorn pigpio pigpio-daemon pydantic
   "
 
   chown -R "$RUN_USER:$RUN_USER" "$APP_DIR" || true
+  # Ensure pigpiod is running.
+  # Prefer systemd service if it exists; otherwise try launching pigpiod directly (from pip pigpio-daemon).
+  if command -v systemctl >/dev/null 2>&1 && systemctl status pigpiod.service >/dev/null 2>&1; then
+    systemctl enable --now pigpiod 2>/dev/null || true
+  else
+    # Try venv pigpiod first, then system PATH
+    if [[ -x "${VENV_DIR}/bin/pigpiod" ]]; then
+      "${VENV_DIR}/bin/pigpiod" 2>/dev/null || true
+    elif command -v pigpiod >/dev/null 2>&1; then
+      pigpiod 2>/dev/null || true
+    fi
+  fi
 
   # systemd unit
   cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
 Description=IR Server (FastAPI + pigpio, COGS endpoints)
-Wants=network-online.target pigpiod.service
-After=network-online.target pigpiod.service
+Wants=network-online.target
+After=network-online.target
 ConditionPathExists=!${DISABLE_FLAG_ETC}
 ConditionPathExists=!${BOOT_FLAG_1}
 ConditionPathExists=!${BOOT_FLAG_2}
@@ -98,7 +118,6 @@ EOF
 
   systemctl daemon-reload
   systemctl enable "${SERVICE}"
-  systemctl restart pigpiod
   systemctl restart "${SERVICE}"
 
   log "Installed. Service: ${SERVICE} (port ${PORT})"
@@ -144,7 +163,7 @@ info_srv(){
   echo "Resources:"
   echo "  Signals folder: ${SIGNALS_DIR}"
   echo "  Server reads signals folder via env: IR_SIGNALS_DIR=${IR_SIGNALS_DIR}"
-  echo "  pigpiod service: pigpiod.service (must be running)"
+  echo "  pigpiod daemon: must be running (systemd pigpiod.service if available, otherwise pigpiod process)"
 }
 
 case "${1:-install}" in
