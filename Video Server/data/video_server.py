@@ -6,9 +6,10 @@ try:
 except Exception:
     # for Python 3.8/3.9 if needed: pip install typing_extensions
     from typing_extensions import Literal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
-from fastapi import Request
 
 def _first(v):
     # flatten values that may come from parse_qs
@@ -1011,6 +1012,50 @@ app = FastAPI()
 _controller: Optional[VideoController] = None
 _controller_lock = threading.Lock()
 
+
+SERVICE_NAME = "video"
+
+def api_ok(action: str, message: str = "ok", **extra):
+    payload = {"ok": True, "service": SERVICE_NAME, "action": action, "message": message}
+    payload.update(extra)
+    return payload
+
+
+def _error_payload(message: str, path: str, error_code: str, **extra):
+    payload = {
+        "ok": False,
+        "service": SERVICE_NAME,
+        "action": "error",
+        "message": message,
+        "path": path,
+        "error_code": error_code,
+    }
+    payload.update(extra)
+    return payload
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("where") or str(detail)
+        extra = {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in detail.items() if k != "message"}
+    else:
+        message = str(detail)
+        extra = {}
+    return JSONResponse(status_code=exc.status_code, content=_error_payload(message, request.url.path, f"http_{exc.status_code}", **extra))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content=_error_payload("Invalid request", request.url.path, "validation_error"))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content=_error_payload(str(exc), request.url.path, "internal_error"))
+
+
 # --- Error helpers & debug utilities ---
 logging.basicConfig(level=logging.INFO)
 
@@ -1097,7 +1142,7 @@ def osd_message(body: MessageBody):
             margin_x=body.margin_x,
             margin_y=body.margin_y,
         )
-    return {"status": "ok"}
+    return api_ok("message", "osd message shown")
 
 
 @app.post("/play")
@@ -1107,7 +1152,7 @@ def play_main(body: PlayBody):
             if not _controller:
                 raise RuntimeError("Controller not initialized (did you start the script directly, not via `uvicorn video_server:app`?)")
             _controller.play_main(body.path)
-        return {"status": "ok"}
+        return api_ok("play", "main video started", path=body.path)
     except Exception as e:
         raise _http_500("POST /play", e)
 
@@ -1117,12 +1162,7 @@ def status():
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         t = _controller.get_time()
-        return {
-            "main": _controller.main_path,
-            "time_pos": t,
-            "interrupt_active": _controller.interrupt_active,
-            "interrupt_mode": _controller.interrupt_mode
-        }
+        return api_ok("status", "video status fetched", main=_controller.main_path, time_pos=t, interrupt_active=_controller.interrupt_active, interrupt_mode=_controller.interrupt_mode)
 
 @app.post("/interrupt/return")
 def interrupt_return(body: InterruptBody):
@@ -1131,7 +1171,7 @@ def interrupt_return(body: InterruptBody):
             if not _controller:
                 raise RuntimeError("Controller not initialized")
             _controller.interrupt(body.path, "return")
-        return {"status": "ok"}
+        return api_ok("interrupt_return", "interrupt started", path=body.path, mode="return")
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1150,7 +1190,7 @@ def interrupt_skip(body: InterruptBody):
             if not _controller:
                 raise RuntimeError("Controller not initialized")
             _controller.interrupt(body.path, "skip")
-        return {"status": "ok"}
+        return api_ok("interrupt_skip", "interrupt started", path=body.path, mode="skip")
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -1178,7 +1218,7 @@ def overlay(body: OverlayBody):
                 rotate_deg=body.rotate_deg,
                 duration_ms=body.duration_ms
             )
-        return {"status": "ok"}
+        return api_ok("overlay", "overlay shown")
     except Exception as e:
         raise _http_500("POST /overlay", e)
 
@@ -1187,7 +1227,7 @@ def overlay(body: OverlayBody):
 @app.get("/debug/mpvlog")
 def debug_mpvlog(lines: int = 120):
     try:
-        return {"tail": _tail_mpv_log(lines)}
+        return api_ok("debug_mpvlog", "mpv log tail fetched", tail=_tail_mpv_log(lines))
     except Exception as e:
         raise _http_500("GET /debug/mpvlog", e)
 
@@ -1211,7 +1251,7 @@ def osd_timer_start(body: OSDTimerBody):
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
-    return {"status": "ok"}
+    return api_ok("timer_start", "timer started")
 
 @app.post("/timer/osd/stop")
 def osd_timer_stop():
@@ -1219,7 +1259,7 @@ def osd_timer_stop():
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.stop_osd_timer()
-    return {"status": "ok"}
+    return api_ok("timer_stop", "timer stopped")
 
 @app.post("/timer/osd/pause")
 def osd_timer_pause():
@@ -1227,7 +1267,7 @@ def osd_timer_pause():
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.pause_osd_timer()
-    return {"status": "ok"}
+    return api_ok("timer_pause", "timer paused")
 
 @app.post("/timer/osd/resume")
 def osd_timer_resume():
@@ -1235,7 +1275,7 @@ def osd_timer_resume():
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.resume_osd_timer()
-    return {"status": "ok"}
+    return api_ok("timer_resume", "timer resumed")
 
 
 # ---------- OVERLAY (headerless) ----------
@@ -1256,7 +1296,7 @@ def cogs_overlay_get(
             margin_x=margin_x, margin_y=margin_y,
             duration_ms=duration_ms, rotate_deg=rotate_deg
         )
-    return {"ok": True}
+    return api_ok("cogs_overlay", "overlay shown")
 
 @app.post("/cogs/overlay")
 async def cogs_overlay_post(request: Request):
@@ -1274,7 +1314,7 @@ async def cogs_overlay_post(request: Request):
             duration_ms=int(d.get("duration_ms", 2000)),
             rotate_deg=int(d.get("rotate_deg", 0)),
         )
-    return {"ok": True}
+    return api_ok("cogs_overlay", "overlay shown")
 
 
 # ---------- TIMER OSD (headerless) ----------
@@ -1299,7 +1339,7 @@ def cogs_timer_osd_start_get(
             position_mode, x, y, margin_x, margin_y,
             text_color, outline_color
         )
-    return {"ok": True}
+    return api_ok("cogs_timer_start", "timer started")
 
 @app.post("/cogs/timer/osd/start")
 async def cogs_timer_osd_start_post(request: Request):
@@ -1322,25 +1362,25 @@ async def cogs_timer_osd_start_post(request: Request):
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
-    return {"ok": True}
+    return api_ok("cogs_timer_start", "timer started")
 
 @app.get("/cogs/timer/osd/pause")
 def cogs_timer_osd_pause_get():
     with _controller_lock:
         _controller.pause_osd_timer()
-    return {"ok": True}
+    return api_ok("cogs_timer_pause", "timer paused")
 
 @app.get("/cogs/timer/osd/resume")
 def cogs_timer_osd_resume_get():
     with _controller_lock:
         _controller.resume_osd_timer()
-    return {"ok": True}
+    return api_ok("cogs_timer_resume", "timer resumed")
 
 @app.get("/cogs/timer/osd/stop")
 def cogs_timer_osd_stop_get():
     with _controller_lock:
         _controller.stop_osd_timer()
-    return {"ok": True}
+    return api_ok("cogs_timer_stop", "timer stopped")
 
 # ---------- INTERRUPT (headerless, for COGS) ----------
 @app.get("/cogs/interrupt/return")
@@ -1349,7 +1389,7 @@ def cogs_interrupt_return_get(path: str, vol: int = 100):
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.interrupt(path, "return", vol)
-    return {"ok": True}
+    return api_ok("cogs_interrupt_return", "interrupt started", path=path, vol=vol, mode="return")
 
 
 @app.get("/cogs/interrupt/skip")
@@ -1358,7 +1398,7 @@ def cogs_interrupt_skip_get(path: str, vol: int = 100):
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.interrupt(path, "skip", vol)
-    return {"ok": True}
+    return api_ok("cogs_interrupt_skip", "interrupt started", path=path, vol=vol, mode="skip")
 
 
 @app.post("/cogs/interrupt/return")
@@ -1374,7 +1414,7 @@ async def cogs_interrupt_return_post(request: Request):
             raise HTTPException(500, "Controller not initialized")
         _controller.interrupt(str(d["path"]), "return", vol)
 
-    return {"ok": True}
+    return api_ok("cogs_interrupt_return", "interrupt started", path=str(d["path"]), vol=vol, mode="return")
 
 
 @app.post("/cogs/interrupt/skip")
@@ -1390,7 +1430,7 @@ async def cogs_interrupt_skip_post(request: Request):
             raise HTTPException(500, "Controller not initialized")
         _controller.interrupt(str(d["path"]), "skip", vol)
 
-    return {"ok": True}
+    return api_ok("cogs_interrupt_skip", "interrupt started", path=str(d["path"]), vol=vol, mode="skip")
 
 
 @app.get("/cogs/play")
@@ -1399,7 +1439,7 @@ def cogs_play_get(path: str):
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.play_main(path)
-    return {"ok": True}
+    return api_ok("cogs_play", "main video started", path=path)
 
 
 @app.post("/cogs/play")
@@ -1411,7 +1451,7 @@ async def cogs_play_post(request: Request):
         if not _controller:
             raise HTTPException(500, "Controller not initialized")
         _controller.play_main(str(d["path"]))
-    return {"ok": True}
+    return api_ok("cogs_play", "main video started", path=str(d["path"]))
 
 
 from urllib.parse import unquote_plus
@@ -1442,7 +1482,7 @@ def cogs_overlay_path(rotate_deg: int, align: str, margin_x: int, margin_y: int,
             duration_ms=int(duration_ms),
             rotate_deg=int(rotate_deg),
         )
-    return {"ok": True}
+    return api_ok("cogs_overlay_path", "overlay shown")
 
 
 @app.get("/cogs/volume")
@@ -1462,7 +1502,7 @@ def cogs_set_volume(level: int):
         except Exception:
             pass
 
-    return {"ok": True, "volume": vol}
+    return api_ok("cogs_volume", "volume updated", volume=vol)
 
 
 

@@ -4,7 +4,9 @@ import json
 import time
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 import uvicorn
 
 import pigpio
@@ -29,6 +31,46 @@ MIN_PULSES_TO_ACCEPT = 6     # ignore tiny/noisy captures
 os.makedirs(SIGNALS_DIR, exist_ok=True)
 
 app = FastAPI(title="IR Learn/Send Server", version="1.1 (COGS-style URLs)")
+
+
+SERVICE_NAME = "ir"
+
+def api_ok(action: str, message: str = "ok", **extra):
+    payload = {"ok": True, "service": SERVICE_NAME, "action": action, "message": message}
+    payload.update(extra)
+    return payload
+
+
+def _error_payload(message: str, path: str, error_code: str):
+    return {
+        "ok": False,
+        "service": SERVICE_NAME,
+        "action": "error",
+        "message": message,
+        "path": path,
+        "error_code": error_code,
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content=_error_payload(str(exc.detail), request.url.path, f"http_{exc.status_code}"))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content=_error_payload("Invalid request", request.url.path, "validation_error"))
+
+
+@app.exception_handler(FileNotFoundError)
+async def file_not_found_handler(request: Request, exc: FileNotFoundError):
+    return JSONResponse(status_code=404, content=_error_payload(f"Signal '{exc}' not found", request.url.path, "file_not_found"))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content=_error_payload(str(exc), request.url.path, "internal_error"))
+
 
 # =========================
 # pigpio init
@@ -268,14 +310,7 @@ def learn_get(
     canonical, repeats, gap_us = compress_repeats(frames)
     canonical = [(round_us(d) if d > 0 else -round_us(-d)) for d in canonical]
 
-    result = {
-        "ok": True,
-        "frames_detected": len(frames),
-        "canonical_durations_us": canonical,
-        "repeats": repeats,
-        "gap_us": gap_us,
-        "total_pulses": len(raw),
-    }
+    result = api_ok("learn", "ir signal learned", frames_detected=len(frames), canonical_durations_us=json.dumps(canonical), repeats=repeats, gap_us=gap_us, total_pulses=len(raw))
 
     if name:
         payload = {
@@ -328,7 +363,7 @@ def send_saved_get(
     except Exception as e:
         raise HTTPException(400, f"Failed to send: {e}")
 
-    return {"ok": True, "name": name, "repeat": repeats, "gap_us": gap_us, "carrier_khz": carrier_khz, "scale": scale}
+    return api_ok("send", "ir signal sent", name=name, repeat=repeats, gap_us=gap_us, carrier_khz=carrier_khz, scale=scale)
 
 @app.get("/cogs/ir/send_raw")
 def send_raw_get(
@@ -343,21 +378,22 @@ def send_raw_get(
     except Exception as e:
         raise HTTPException(400, f"Failed to send: {e}")
 
-    return {"ok": True, "count": len(durations), "repeat": repeat, "gap_us": gap_us, "carrier_khz": carrier}
+    return api_ok("send_raw", "raw ir signal sent", count=len(durations), repeat=repeat, gap_us=gap_us, carrier_khz=carrier)
 
 # Convenience/inspection (also GET)
 @app.get("/cogs/ir/status")
 def status_get():
-    return {"ok": True, "tx_gpio": TX_GPIO, "rx_gpio": RX_GPIO, "signals": list_signals()}
+    return api_ok("status", "ir status fetched", tx_gpio=TX_GPIO, rx_gpio=RX_GPIO, signals=json.dumps(list_signals()))
 
 @app.get("/cogs/ir/signals")
 def signals_get():
-    return {"ok": True, "signals": list_signals()}
+    return api_ok("signals", "ir signals fetched", signals=json.dumps(list_signals()))
 
 @app.get("/cogs/ir/signal")
 def signal_get(name: str = Query(...)):
     try:
-        return load_signal(name)
+        data = load_signal(name)
+        return api_ok("signal", "ir signal fetched", name=name, signal=json.dumps(data))
     except FileNotFoundError:
         raise HTTPException(404, f"Signal '{name}' not found")
 
@@ -367,7 +403,7 @@ def delete_get(name: str = Query(...)):
     if not os.path.exists(path):
         raise HTTPException(404, f"Signal '{name}' not found")
     os.remove(path)
-    return {"ok": True, "deleted": name}
+    return api_ok("delete", "ir signal deleted", deleted=name)
 
 @app.get("/cogs/ir/stop")
 def stop_tx():
@@ -380,7 +416,7 @@ def stop_tx():
         pi.wave_clear()
     except pigpio.error:
         pass
-    return {"ok": True, "stopped": True}
+    return api_ok("stop", "ir transmission stopped", stopped=True)
 
 # =========================
 # Graceful shutdown

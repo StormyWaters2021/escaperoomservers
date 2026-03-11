@@ -11,8 +11,9 @@ Notes
 import os, json, time
 from typing import Dict, Any, Optional
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 
 # ---------- Config ----------
 APP_TITLE = "Hue Server (path-only)"
@@ -21,6 +22,41 @@ REQUEST_TIMEOUT = float(os.environ.get("HUE_TIMEOUT", "3.0"))
 DEVICETYPE = "hue-server#pi"  # registration identifier
 
 app = FastAPI(title=APP_TITLE, version="1.1")
+
+
+SERVICE_NAME = "hue"
+
+def api_ok(action: str, message: str = "ok", **extra):
+    payload = {"ok": True, "service": SERVICE_NAME, "action": action, "message": message}
+    payload.update(extra)
+    return payload
+
+
+def _error_payload(message: str, path: str, error_code: str):
+    return {
+        "ok": False,
+        "service": SERVICE_NAME,
+        "action": "error",
+        "message": message,
+        "path": path,
+        "error_code": error_code,
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content=_error_payload(str(exc.detail), request.url.path, f"http_{exc.status_code}"))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content=_error_payload("Invalid request", request.url.path, "validation_error"))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content=_error_payload(str(exc), request.url.path, "internal_error"))
+
 
 
 # ---------- Color presets (name -> Hue state) ----------
@@ -143,7 +179,7 @@ def _confirm_state(cfg, light_id: str, want_on: bool, retries: int = 5, delay_s:
 @app.get("/cogs/health")
 def cogs_health():
     cfg = load_cfg()
-    return {"status": "ok", "bridge_ip": cfg.get("bridge_ip", ""), "mapped": len(cfg.get("map", {}))}
+    return api_ok("health", "hue server healthy", bridge_ip=cfg.get("bridge_ip", ""), mapped=len(cfg.get("map", {})))
 
 @app.get("/cogs/hue/state/{name}")
 def cogs_hue_state(name: str):
@@ -154,7 +190,7 @@ def cogs_hue_state(name: str):
     cfg = load_cfg(); require_bridge(cfg)
     lid = _resolve_light_id_by_name(cfg, name)
     on = _get_light_state(cfg, lid)
-    return {"ok": True, "name": _norm_name(name), "light_id": lid, "on": bool(on)}
+    return api_ok("light_state", "light state fetched", name=_norm_name(name), light_id=lid, on=bool(on))
 
 @app.get("/cogs/hue/on/{name}")
 def cogs_hue_on(name: str):
@@ -162,7 +198,7 @@ def cogs_hue_on(name: str):
     lid = _resolve_light_id_by_name(cfg, name)
     _set_on_state(cfg, lid, True)
     confirmed = _confirm_state(cfg, lid, True)
-    return {"ok": True, "light_id": lid, "on": True, "confirmed": bool(confirmed)}
+    return api_ok("light_on", "light turned on", light_id=lid, name=_norm_name(name), on=True, confirmed=bool(confirmed))
 
 @app.get("/cogs/hue/off/{name}")
 def cogs_hue_off(name: str):
@@ -170,7 +206,7 @@ def cogs_hue_off(name: str):
     lid = _resolve_light_id_by_name(cfg, name)
     _set_on_state(cfg, lid, False)
     confirmed = _confirm_state(cfg, lid, False)
-    return {"ok": True, "light_id": lid, "on": False, "confirmed": bool(confirmed)}
+    return api_ok("light_off", "light turned off", light_id=lid, name=_norm_name(name), on=False, confirmed=bool(confirmed))
 
 # ---------- Local admin PATH endpoints ----------
 @app.get("/hue/register/ip/{ip}")
@@ -198,7 +234,7 @@ def hue_register_path(ip: str):
     cfg["username"] = username
     cfg.setdefault("map", {})
     save_cfg(cfg)
-    return {"ok": True, "bridge_ip": ip, "username_saved": True}
+    return api_ok("register_bridge", "bridge registered", bridge_ip=ip, username_saved=True)
 
 @app.get("/hue/list")
 def hue_list():
@@ -212,9 +248,9 @@ def hue_list():
             "type": info.get("type"),
             "on": info.get("state", {}).get("on", None)
         })
-    return {"ok": True, "lights": trimmed}
+    return api_ok("list_lights", "lights fetched", lights=json.dumps(trimmed))
 
-@app.get("/hue/status/txt", response_class=PlainTextResponse)
+@app.get("/hue/status/txt")
 def hue_status_txt():
     cfg = load_cfg(); require_bridge(cfg)
     lights = hue_get(cfg, "/lights")
@@ -224,57 +260,59 @@ def hue_status_txt():
         tp = info.get("type", "")
         on = info.get("state", {}).get("on", None)
         lines.append(f"{lid}\t{nm}\t{tp}\t(on={on})")
-    return "\n".join(lines) + ("\n" if lines else "")
+    return api_ok("status_text", "light status fetched", text="\n".join(lines) + ("\n" if lines else ""), count=len(lines))
 
 @app.get("/hue/map/{name}/{light_id}")
 def hue_map_path(name: str, light_id: str):
     cfg = load_cfg()
     cfg.setdefault("map", {})[_norm_name(name)] = str(light_id)
     save_cfg(cfg)
-    return {"ok": True, "mapped": {_norm_name(name): str(light_id)}}
+    return api_ok("map_light", "light mapped", name=_norm_name(name), light_id=str(light_id))
 
 @app.get("/hue/unmap/{name}")
 def hue_unmap_path(name: str):
     cfg = load_cfg()
     existed = cfg.get("map", {}).pop(_norm_name(name), None)
     save_cfg(cfg)
-    return {"ok": True, "removed": bool(existed)}
+    return api_ok("unmap_light", "mapping removed", name=_norm_name(name), removed=bool(existed))
 
 @app.get("/hue/mappings")
 def hue_mappings():
     cfg = load_cfg()
-    return {"ok": True, "map": cfg.get("map", {})}
+    return api_ok("mappings", "mappings fetched", map=json.dumps(cfg.get("map", {})))
 
-@app.get("/hue/mappings/txt", response_class=PlainTextResponse)
+@app.get("/hue/mappings/txt")
 def hue_mappings_txt():
     cfg = load_cfg()
     m = cfg.get("map", {})
     if not m:
-        return "(no mappings)\n"
+        return api_ok("mappings_text", "mappings fetched", text="(no mappings)\\n", count=0)
     lines = [f"{k} -> {v}" for k, v in sorted(m.items())]
-    return "\n".join(lines) + "\n"
+    return api_ok("mappings_text", "mappings fetched", text="\\n".join(lines) + "\\n", count=len(lines))
 
 @app.get("/")
 def root():
-    return {
-        "service": "hue-server-pathonly",
-        "cogs": [
+    return api_ok(
+        "root",
+        "hue server running",
+        server_name="hue-server-pathonly",
+        cogs=json.dumps([
             "/cogs/health",
             "/cogs/hue/state/{Name_or_Name_With_Underscores}",
             "/cogs/hue/on/{Name_or_Name_With_Underscores}",
             "/cogs/hue/off/{Name_or_Name_With_Underscores}",
-        ],
-        "admin": [
+        ]),
+        admin=json.dumps([
             "/hue/register/ip/{bridge_ip}",
             "/hue/list",
             "/hue/status/txt",
-            "/hue/map/{name}/{light_id}",
-            "/hue/unmap/{name}",
+            "/hue/map/{friendly_name}/{light_id}",
+            "/hue/unmap/{friendly_name}",
             "/hue/mappings",
             "/hue/mappings/txt",
             "/hue/map/all",
-        ],
-    }
+        ]),
+    )
 
 @app.get("/hue/map/all")
 def hue_map_all():
@@ -288,7 +326,7 @@ def hue_map_all():
             cfg["map"][nm] = str(lid)
             added += 1
     save_cfg(cfg)
-    return {"ok": True, "mapped_count": added}
+    return api_ok("map_all", "lights mapped", mapped_count=added)
     
 
 # ---------- NEW COGS endpoint: color by name ----------
@@ -334,14 +372,7 @@ def cogs_hue_color_name(name: str, color: str):
 
     res = hue_put(cfg, f"/lights/{lid}/state", body)
 
-    return {
-        "ok": True,
-        "name": _norm_name(name),
-        "light_id": lid,
-        "color": color_key,
-        "state_sent": body,
-        "bridge_response": res,
-    }
+    return api_ok("color_name", "light color updated", name=_norm_name(name), light_id=lid, color=color_key, state_sent=json.dumps(body), bridge_response=json.dumps(res))
     
 
 @app.get("/cogs/hue/bri/{name}/{percent}")
@@ -367,13 +398,7 @@ def cogs_hue_brightness(name: str, percent: int):
 
     hue_put(cfg, f"/lights/{lid}/state", {"bri": bri})
 
-    return {
-        "ok": True,
-        "name": _norm_name(name),
-        "light_id": lid,
-        "percent": percent,
-        "bri": bri,
-    }
+    return api_ok("brightness", "brightness updated", name=_norm_name(name), light_id=lid, percent=percent, bri=bri)
 
 
 @app.get("/cogs/hue/bri/up/{name}/{delta}")
@@ -425,7 +450,7 @@ def cogs_hue_color_hs(name: str, hue: int, sat: int):
     hue = max(0, min(65535, int(hue)))
     sat = max(0, min(254, int(sat)))
     hue_put(cfg, f"/lights/{lid}/state", {"hue": hue, "sat": sat})
-    return {"ok": True, "light_id": lid, "hue": hue, "sat": sat}
+    return api_ok("color_hs", "light color updated", name=_norm_name(name), light_id=lid, hue=hue, sat=sat)
 
 
 @app.get("/cogs/hue/color/ct/{name}/{mireds}")
@@ -437,7 +462,7 @@ def cogs_hue_color_ct(name: str, mireds: int):
     lid = _resolve_light_id_by_name(cfg, name)
     mireds = max(153, min(500, int(mireds)))
     hue_put(cfg, f"/lights/{lid}/state", {"ct": mireds})
-    return {"ok": True, "light_id": lid, "ct": mireds}
+    return api_ok("color_ct", "light color temperature updated", name=_norm_name(name), light_id=lid, ct=mireds)
 
 
 @app.get("/cogs/hue/color/xy/{name}/{x}/{y}")
@@ -448,4 +473,4 @@ def cogs_hue_color_xy(name: str, x: float, y: float):
     cfg = load_cfg(); require_bridge(cfg)
     lid = _resolve_light_id_by_name(cfg, name)
     hue_put(cfg, f"/lights/{lid}/state", {"xy": [float(x), float(y)]})
-    return {"ok": True, "light_id": lid, "xy": [x, y]}
+    return api_ok("color_xy", "light color updated", name=_norm_name(name), light_id=lid, xy=json.dumps([x, y]))
