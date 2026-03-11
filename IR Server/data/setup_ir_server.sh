@@ -48,16 +48,17 @@ ensure_deps() {
 
   # If pigpiod is available from apt, use it.
   if apt-cache show pigpiod >/dev/null 2>&1; then
-    apt-get install -y pigpiod || true
-    systemctl enable --now pigpiod 2>/dev/null || true
-    log "Installed pigpiod from apt."
-    return 0
+    if apt-get install -y pigpiod; then
+      systemctl enable --now pigpiod 2>/dev/null || true
+      log "Installed pigpiod from apt."
+      return 0
+    fi
   fi
 
   log "pigpiod not available via apt. Building pigpio (pigpiod) from source..."
 
   # Build dependencies for pigpio
-  apt-get install -y git make gcc libc6-dev
+  apt-get install -y git make gcc libc6-dev pkg-config
 
   local TMP="/tmp/pigpio-src"
   rm -rf "$TMP"
